@@ -1,0 +1,30 @@
+{
+  "name": "kaasupay-backend",
+  "version": "1.0.0",
+  "description": "KaasuPay Day 2 - MongoDB-backed auth and wallet backend with JWT-protected routes",
+  "main": "index.js",
+  "scripts": {
+    "dev": "nodemon index.js",
+    "start": "node index.js",
+    "start:worker": "node worker.js",
+    "start:bank": "node tools/fake-bank.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.5",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^9.11.0",
+    "razorpay": "^2.9.8",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "^11.3.0",
+    "nodemon": "^3.1.14"
+  }
+}
