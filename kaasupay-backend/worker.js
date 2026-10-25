@@ -233,14 +233,21 @@ export class PayoutWorker {
     this.options = options;
     this.running = false;
     this.loopPromise = null;
+    this.lastPollAt = null;
+    this.pollCount = 0;
+    this.startedAt = null;
+    this.lastError = null;
   }
 
   async start() {
     this.running = true;
+    this.startedAt = new Date();
     console.log("[worker] Payout worker started.");
 
     while (this.running) {
       try {
+        this.lastPollAt = new Date();
+        this.pollCount++;
         const job = await claimNextJob(this.options);
         if (!job) {
           await sleep(1000);
@@ -249,6 +256,7 @@ export class PayoutWorker {
 
         await processJob(job, this.options);
       } catch (err) {
+        this.lastError = err.message;
         console.error("[worker] Loop error:", err.message);
         await sleep(1000);
       }
@@ -258,6 +266,24 @@ export class PayoutWorker {
   stop() {
     this.running = false;
     console.log("[worker] Payout worker stopped.");
+  }
+
+  getStatus() {
+    const now = Date.now();
+    const isAlive = Boolean(
+      this.running &&
+      this.lastPollAt &&
+      (now - this.lastPollAt.getTime()) < 30000
+    );
+
+    return {
+      running: this.running,
+      loopAlive: isAlive,
+      startedAt: this.startedAt ? this.startedAt.toISOString() : null,
+      lastPollAt: this.lastPollAt ? this.lastPollAt.toISOString() : null,
+      pollCount: this.pollCount,
+      lastError: this.lastError || null,
+    };
   }
 }
 

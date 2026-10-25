@@ -105,6 +105,7 @@ async function main() {
     BANK_URL,
     BANK_ENCRYPTION_KEY: "test_bank_key_32bytes_shared_ok",
     NODE_ENV: "development",
+    DISABLE_WORKER: "true",
   };
   const server = spawnServer(serverEnv);
 
