@@ -1,5 +1,17 @@
 
 services:
+  fake-bank:
+    build: .
+    command: ["node", "tools/fake-bank.js"]
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      FAKE_BANK_PORT: 4000
+    expose:
+      - "4000"
+    ports:
+      - "4000:4000"
+
   kaasupay-1:
     build: .
     environment:
@@ -8,9 +20,12 @@ services:
       MONGO_URL: ${MONGO_URL:?MONGO_URL must be set in .env}
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env}
       ADMIN_KEY: ${ADMIN_KEY:?ADMIN_KEY must be set in .env}
+      BANK_URL: http://fake-bank:4000
       INSTANCE_NAME: kaasupay-1
     expose:
       - "3000"
+    depends_on:
+      - fake-bank
 
   kaasupay-2:
     build: .
@@ -20,9 +35,12 @@ services:
       MONGO_URL: ${MONGO_URL:?MONGO_URL must be set in .env}
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env}
       ADMIN_KEY: ${ADMIN_KEY:?ADMIN_KEY must be set in .env}
+      BANK_URL: http://fake-bank:4000
       INSTANCE_NAME: kaasupay-2
     expose:
       - "3000"
+    depends_on:
+      - fake-bank
 
   kaasupay-3:
     build: .
@@ -32,9 +50,12 @@ services:
       MONGO_URL: ${MONGO_URL:?MONGO_URL must be set in .env}
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env}
       ADMIN_KEY: ${ADMIN_KEY:?ADMIN_KEY must be set in .env}
+      BANK_URL: http://fake-bank:4000
       INSTANCE_NAME: kaasupay-3
     expose:
       - "3000"
+    depends_on:
+      - fake-bank
   
   nginx:
     image: nginx:alpine

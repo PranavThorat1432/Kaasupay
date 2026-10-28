@@ -30,7 +30,17 @@ export const PORT = process.env.PORT || 3000;
 export const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:5173";
 
 // Core Banking URL (Day 5 - used by Payout Worker)
-export const BANK_URL = process.env.BANK_URL || "http://localhost:4000";
+function resolveBankUrl() {
+  const url = process.env.BANK_URL || "http://localhost:4000";
+  try {
+    new URL(url);
+    return url;
+  } catch (err) {
+    console.error(`Invalid BANK_URL configured: "${url}". Must be a valid HTTP/HTTPS URL.`);
+    process.exit(1);
+  }
+}
+export const BANK_URL = resolveBankUrl();
 
 // Razorpay credentials (Day 4 - API-specific).
 // In production, missing credentials fail fast when validateApiConfig() is called by the API.

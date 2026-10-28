@@ -80,6 +80,11 @@ export async function processJob(
       return { status: "DONE", detail: "Already terminal" };
     }
 
+    if (withdrawal.status === "NEEDS_REVIEW") {
+      await OutboxEvent.updateOne({ _id: job._id }, { $set: { status: "STUCK" } });
+      return { status: "NEEDS_REVIEW", detail: "Withdrawal is parked in NEEDS_REVIEW" };
+    }
+
     // Transition PENDING -> PROCESSING on first attempt
     if (withdrawal.status === "PENDING") {
       await Withdrawal.updateOne(
@@ -111,27 +116,29 @@ export async function processJob(
     let resData = null;
     let errorName = null;
     let errorMessage = null;
+    let networkError = null;
 
-    try {
-      response = await fetch(`${bankUrl}/payouts`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          reference: withdrawal.reference,
-          accountNumber: rawAccountNumber,
-          ifsc: withdrawal.bankAccountId.ifsc,
-          amount: withdrawal.amount,
-        }),
-        signal: controller.signal,
-      });
+      try {
+        response = await fetch(`${bankUrl}/payouts`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            reference: withdrawal.reference,
+            accountNumber: rawAccountNumber,
+            ifsc: withdrawal.bankAccountId.ifsc,
+            amount: withdrawal.amount,
+          }),
+          signal: controller.signal,
+        });
 
-      resData = await response.json().catch(() => ({}));
-    } catch (err) {
-      errorName = err.name;
-      errorMessage = err.message;
-    } finally {
-      clearTimeout(timer);
-    }
+        resData = await response.json().catch(() => ({}));
+      } catch (err) {
+        errorName = err.name;
+        errorMessage = err.message;
+        networkError = err;
+      } finally {
+        clearTimeout(timer);
+      }
 
     // 1. CONFIRMED BANK SUCCESS (HTTP 200 with SUCCESS)
     if (response && response.status === 200 && resData?.status === "SUCCESS") {
@@ -145,8 +152,12 @@ export async function processJob(
       return { status: "SUCCESS", bankRef };
     }
 
-    // 2. DEFINITIVE REFUSAL (HTTP 200 with FAILED, e.g. closed account)
-    if (response && response.status === 200 && resData?.status === "FAILED") {
+    // 2. DEFINITIVE REFUSAL (HTTP 200 or 422 with FAILED/REJECTED, e.g. closed account)
+    if (
+      response &&
+      (response.status === 200 || response.status === 422) &&
+      (resData?.status === "FAILED" || resData?.status === "REJECTED")
+    ) {
       const reason = resData.reason || "Account closed";
       await reverseWithdrawal({ withdrawalId: withdrawal._id, reason });
       await OutboxEvent.updateOne({ _id: job._id }, { $set: { status: "DONE" } });
@@ -169,15 +180,63 @@ export async function processJob(
 
     // 4. AMBIGUOUS / TEMPORARY FAILURE (202 PROCESSING, 5xx, timeout, network error)
     let errDesc = "Unknown error";
+    let errorCategory = "UNKNOWN";
+    let errorCode = null;
+
     if (errorName === "AbortError") {
       errDesc = "Bank timed out";
+      errorCategory = "TIMEOUT_ABORTED";
+      errorCode = "ETIMEDOUT";
     } else if (response && response.status === 202) {
       errDesc = "Bank is still processing";
+      errorCategory = "BANK_PROCESSING";
+      errorCode = 202;
+    } else if (response && response.status >= 500) {
+      errDesc = `Bank said ${response.status}`;
+      errorCategory = "HTTP_5XX";
+      errorCode = response.status;
     } else if (response) {
       errDesc = `Bank said ${response.status}`;
+      errorCategory = "UNEXPECTED_STATUS";
+      errorCode = response.status;
+    } else if (networkError) {
+      const causeCode = networkError.cause?.code || networkError.code;
+      const causeMsg = networkError.cause?.message || networkError.message;
+      errorCode = causeCode || "NETWORK_FAIL";
+
+      if (causeCode === "ECONNREFUSED") {
+        errorCategory = "CONNECTION_REFUSED";
+        errDesc = `Could not reach bank: connection refused (ECONNREFUSED)`;
+      } else if (causeCode === "ENOTFOUND" || causeCode === "EAI_AGAIN") {
+        errorCategory = "DNS_RESOLUTION_FAILURE";
+        errDesc = `Could not reach bank: DNS resolution failed (${causeCode})`;
+      } else if (causeCode === "ETIMEDOUT" || causeCode === "UND_ERR_CONNECT_TIMEOUT") {
+        errorCategory = "CONNECTION_TIMEOUT";
+        errDesc = `Could not reach bank: connection timed out (${causeCode})`;
+      } else {
+        errorCategory = "NETWORK_ERROR";
+        errDesc = causeCode
+          ? `Could not reach bank: ${causeCode} (${causeMsg})`
+          : `Could not reach bank: ${errorMessage}`;
+      }
     } else if (errorMessage) {
       errDesc = `Could not reach bank: ${errorMessage}`;
+      errorCategory = "GENERIC_ERROR";
     }
+
+    // Safe diagnostic logging (no sensitive credentials or account numbers logged)
+    let sanitizedBankOrigin = bankUrl;
+    try {
+      sanitizedBankOrigin = new URL(bankUrl).origin;
+    } catch {
+      // ignore
+    }
+
+    console.warn(
+      `[worker] Bank communication diagnostic: withdrawalId=${withdrawal._id}, ref=${withdrawal.reference}, ` +
+      `attempt=${job.attempts}, bankOrigin=${sanitizedBankOrigin}, timeoutMs=${timeoutMs}, ` +
+      `category=${errorCategory}, code=${errorCode || "N/A"}, error="${errDesc}"`
+    );
 
     // Check maximum attempts threshold (5 tries)
     if (job.attempts < 5) {

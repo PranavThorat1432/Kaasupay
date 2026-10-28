@@ -1,12 +1,13 @@
-// Load .env BEFORE any module reads process.env (config.js validates it).
 import "dotenv/config";
+import http from "node:http";
 import express from "express";
 import cors from "cors";
 import mongoose from "mongoose";
-import { PORT, CLIENT_URL, validateApiConfig } from "./config.js";
+import { PORT, CLIENT_URL, BANK_URL, validateApiConfig } from "./config.js";
 import { connectDB } from "./db.js";
 import apiRouter from "./routes/index.js";
 import { PayoutWorker } from "./worker.js";
+import { createFakeBankApp } from "./tools/fake-bank.js";
 
 // Validate API-specific configuration (fails fast in production if payment secrets are missing).
 validateApiConfig();
@@ -15,6 +16,7 @@ const app = express();
 
 let server = null;
 let workerInstance = null;
+let bankServerInstance = null;
 let isShuttingDown = false;
 
 // Trust reverse proxy (NGINX, Render, Railway) for accurate client IPs in rate limiting
@@ -66,6 +68,10 @@ export function getHealthStatus() {
     database: {
       status: isDbConnected ? "connected" : "disconnected",
     },
+    bank: {
+      url: BANK_URL,
+      embeddedRunning: Boolean(bankServerInstance),
+    },
     worker: workerStatus
       ? {
           status: workerStatus.running ? "running" : "stopped",
@@ -87,6 +93,67 @@ app.get(["/", "/health", "/healthz"], (req, res) => {
 // All versioned API routes hang off /api/v1.
 app.use("/api/v1", apiRouter);
 
+/**
+ * Automatically starts the embedded fake bank simulator if BANK_URL targets
+ * localhost and no external bank process is already listening on that port.
+ */
+export async function ensureFakeBankRunning() {
+  if (process.env.DISABLE_BANK === "true") return null;
+
+  try {
+    const bankUrlObj = new URL(BANK_URL);
+    const isLocal =
+      bankUrlObj.hostname === "localhost" ||
+      bankUrlObj.hostname === "127.0.0.1" ||
+      bankUrlObj.hostname === "0.0.0.0";
+
+    if (!isLocal && process.env.AUTO_START_BANK !== "true") {
+      return null;
+    }
+
+    const targetPort = parseInt(
+      bankUrlObj.port || process.env.FAKE_BANK_PORT || "4000",
+      10
+    );
+
+    // Probe if a bank service is already responding
+    const isAlreadyRunning = await new Promise((resolve) => {
+      const probe = http.get(`${BANK_URL}/health`, (res) => {
+        resolve(res.statusCode < 500);
+      });
+      probe.on("error", () => resolve(false));
+      probe.setTimeout(300, () => {
+        probe.destroy();
+        resolve(false);
+      });
+    });
+
+    if (isAlreadyRunning) {
+      return null;
+    }
+
+    const { app: fakeBankApp } = createFakeBankApp();
+    return new Promise((resolve) => {
+      const bServer = fakeBankApp.listen(targetPort, "0.0.0.0", () => {
+        console.log(`[bank] Fake bank simulator started on http://localhost:${targetPort}`);
+        bankServerInstance = bServer;
+        resolve(bServer);
+      });
+      bServer.on("error", (err) => {
+        if (err.code === "EADDRINUSE") {
+          console.log(`[bank] Port ${targetPort} already in use, using existing listener.`);
+        } else {
+          console.warn(`[bank] Could not start embedded fake bank: ${err.message}`);
+        }
+        resolve(null);
+      });
+    });
+  } catch (err) {
+    console.warn(`[bank] Error verifying fake bank: ${err.message}`);
+    return null;
+  }
+}
+
 // Graceful shutdown: stops worker loop, closes HTTP listener, disconnects database
 export async function stopServer() {
   if (isShuttingDown) return;
@@ -94,6 +161,12 @@ export async function stopServer() {
 
   if (workerInstance) {
     workerInstance.stop();
+  }
+
+  if (bankServerInstance) {
+    await new Promise((resolve) => bankServerInstance.close(resolve));
+    console.log("[server] Fake bank simulator closed.");
+    bankServerInstance = null;
   }
 
   if (server) {
@@ -131,11 +204,18 @@ export function getWorkerInstance() {
   return workerInstance;
 }
 
-// Startup order is deliberate: dotenv → config → MongoDB → Worker → listen.
+export function getBankServerInstance() {
+  return bankServerInstance;
+}
+
+// Startup order is deliberate: dotenv → config → MongoDB → Fake Bank → Worker → listen.
 // The server never accepts requests before the database connection succeeds
 // (connectDB exits the process if the connection fails).
 export async function startServer() {
   await connectDB();
+
+  // Ensure fake bank is reachable for withdrawals when configured for localhost
+  await ensureFakeBankRunning();
 
   // Start the background payout worker alongside Express within this single process
   if (process.env.DISABLE_WORKER !== "true") {
@@ -148,7 +228,7 @@ export async function startServer() {
   return new Promise((resolve) => {
     server = app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
-      resolve({ app, server, worker: workerInstance });
+      resolve({ app, server, worker: workerInstance, bankServer: bankServerInstance });
     });
   });
 }

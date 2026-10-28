@@ -8,6 +8,7 @@
 // down   : every call fails with 503
 // An account number ending in 0000 is a closed account: the bank refuses it for good.
 
+import "dotenv/config";
 import express from "express";
 
 export function createFakeBankApp() {
@@ -18,6 +19,16 @@ export function createFakeBankApp() {
   const payouts = new Map(); // reference -> result. The bank remembers every reference.
   const calls = {}; // reference -> how many times KaasuPay called
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Health check endpoint for monitoring and startup verification
+  app.get(["/", "/health", "/healthz"], (req, res) => {
+    res.json({
+      status: "ok",
+      service: "fake-bank",
+      mode,
+      paid: [...payouts.values()].filter((p) => p.status === "SUCCESS").length,
+    });
+  });
 
   app.post("/mode", (req, res) => {
     mode = req.body?.mode || "normal";
@@ -99,8 +110,12 @@ export function createFakeBankApp() {
 // Standalone runner
 if (process.argv[1] && process.argv[1].replace(/\\/g, "/").endsWith("tools/fake-bank.js")) {
   const { app } = createFakeBankApp();
-  const PORT = process.env.PORT || process.env.FAKE_BANK_PORT || 4000;
-  app.listen(PORT, () => {
+  const PORT = parseInt(
+    process.env.FAKE_BANK_PORT ||
+      (process.env.PORT && process.env.PORT !== "3000" ? process.env.PORT : "4000"),
+    10
+  );
+  app.listen(PORT, "0.0.0.0", () => {
     console.log(`[bank] Fake bank running on http://localhost:${PORT}`);
   });
 }
