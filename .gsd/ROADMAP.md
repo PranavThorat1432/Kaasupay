@@ -6,8 +6,8 @@ updated: 2026-10-29T12:52:00.000Z
 
 # Roadmap: Day 7 Request Money
 
-> **Current Phase:** Phase 5 - Lazy Expiration & Anti-Spam Limits
-> **Status:** Phase 4 Completed. Ready for Phase 5.
+> **Current Phase:** Phase 6 - Frontend Integration, Comprehensive Regression & Deliverables
+> **Status:** Phase 5 Completed. Ready for Phase 6.
 > **Specification:** [.gsd/SPEC.md](file:///c:/Users/hp/Desktop/Sure%20Trust/KaasuPay%20Application/.gsd/SPEC.md)
 
 ---
@@ -18,8 +18,8 @@ updated: 2026-10-29T12:52:00.000Z
 - [x] Protected endpoints under `/api/v1/requests`: create, incoming, outgoing, getById, decline, cancel, and pay.
 - [x] Double-lock pay execution: `Idempotency-Key` replay protection + atomic `status: "PENDING"` state condition.
 - [x] Atomic money transfer inside a single session transaction: daily limit check, wallet debit, wallet credit, `TRANSFER` transaction, and double-entry ledger rows.
-- [ ] Lazy expiry: expired requests reject actions with HTTP `410` and auto-transition to `EXPIRED` in list queries without cron jobs.
-- [ ] Anti-spam protection: maximum 5 pending requests to the same payer (409) and 20/hr request creation rate limit.
+- [x] Lazy expiry: expired requests reject actions with HTTP `410` and auto-transition to `EXPIRED` in list queries without cron jobs.
+- [x] Anti-spam protection: maximum 5 pending requests to the same payer (409) and 20/hr request creation rate limit.
 - [ ] Automated test suite `test/day7.test.js` covering test matrix D1–D6 and concurrency race conditions.
 - [ ] Full interview answers documented in `DAY7_ANSWERS.md`.
 - [ ] Frontend user interface for creating, viewing, paying (with PIN modal), and declining/cancelling requests.
@@ -102,7 +102,7 @@ updated: 2026-10-29T12:52:00.000Z
 ---
 
 ### Phase 5: Lazy Expiration & Anti-Spam Limits (Level 4 & 5 / D5 & D6)
-**Status:** ⬜ Not Started  
+**Status:** ✅ Complete  
 **Objective:** Implement lazy expiration mechanics without background jobs, 5-pending-request spam limit, and 20/hr request creation rate limit.  
 **Depends on:** Phase 4
 

@@ -7,24 +7,23 @@ updated: 2026-10-29T12:41:00.000Z
 ## Current Position
 
 **Milestone:** Day 7 Request Money  
-**Phase:** Phase 4 Complete — Ready for Phase 5 (Lazy Expiration & Anti-Spam Limits)  
-**Status:** In Progress (Ready for `/execute 5`)  
+**Phase:** Phase 5 Complete — Ready for Phase 6 (Frontend Integration, DAY7_ANSWERS.md & Unified Regression)  
+**Status:** In Progress (Ready for `/execute 6`)  
 **Active Branch:** `chore/gsd-setup`
 
 ---
 
 ## Last Action
 
-Executed Phase 4: Atomic Payment Execution & Financial Settlement (Level 3 / D3 & D4).
-- Implemented `payRequest` in `requestController.js` and mounted `POST /:id/pay` in `routes/requestRoutes.js`.
-- Double-lock protection: `Idempotency-Key` replay (excluding PIN from hash) + atomic `status: "PENDING"` state condition.
-- Atomic multi-document MongoDB transaction: request state change to `PAID`, daily limit consumption, payer debit, requester credit, `TRANSFER` transaction log, and double-entry ledger entries.
-- Verified all 42 acceptance test assertions in `test/phase4_pay_request.test.js` (0 failures).
-- Re-verified Phase 1 (34/34), Phase 2 (37/37), and Phase 3 (35/35) test suites.
+Executed Phase 5: Lazy Expiration & Anti-Spam Limits (Level 4 & 5 / D5 & D6).
+- Verified lazy expiration mechanism without cron jobs or background workers.
+- Verified 5-pending requests spam limit (6th rejects with 409) and 20/hr rate limit.
+- Verified simultaneous Pay vs Cancel concurrency race test (`Promise.all`), proving mutual exclusion and zero financial corruption.
+- Verified all 37 acceptance test assertions in `test/phase5_expiry_spam.test.js` (0 failures).
+- Re-verified Phase 1 (34/34), Phase 2 (37/37), Phase 3 (35/35), and Phase 4 (42/42) test suites.
 - Created atomic commits:
-  - `21143f5`: feat(phase-4): implement payRequest handler and mount pay route
-  - `045427b`: test(phase-4): add Level 3 & Level 4 (D3 & D4) acceptance test suite
-- Completed Phase 4 documentation: `.gsd/phases/4/01-SUMMARY.md`.
+  - `ce76b6c`: test(phase-5): add Level 4 & Level 5 (D5 & D6) acceptance and race test suite
+- Completed Phase 5 documentation: `.gsd/phases/5/01-SUMMARY.md`.
 
 ---
 
