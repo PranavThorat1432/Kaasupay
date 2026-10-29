@@ -5,6 +5,8 @@ import {
   getIncomingRequests,
   getOutgoingRequests,
   getRequestById,
+  declineRequest,
+  cancelRequest,
 } from "../controllers/requestController.js";
 import { requireAuth } from "../middleware/authMiddleware.js";
 import { rateLimit } from "../middleware/rateLimiter.js";
@@ -24,5 +26,7 @@ router.post("/", requireAuth, requestCreateLimiter, createRequest);
 router.get("/incoming", requireAuth, getIncomingRequests);
 router.get("/outgoing", requireAuth, getOutgoingRequests);
 router.get("/:id", requireAuth, getRequestById);
+router.post("/:id/decline", requireAuth, declineRequest);
+router.post("/:id/cancel", requireAuth, cancelRequest);
 
 export default router;
