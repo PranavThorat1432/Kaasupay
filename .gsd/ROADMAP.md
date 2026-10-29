@@ -6,16 +6,16 @@ updated: 2026-10-29T12:52:00.000Z
 
 # Roadmap: Day 7 Request Money
 
-> **Current Phase:** Phase 1 - Data Model & Input Validation
-> **Status:** Planning Completed (Awaiting Approval)
+> **Current Phase:** Phase 4 - Atomic Payment Execution & Financial Settlement
+> **Status:** Phase 3 Completed. Ready for Phase 4.
 > **Specification:** [.gsd/SPEC.md](file:///c:/Users/hp/Desktop/Sure%20Trust/KaasuPay%20Application/.gsd/SPEC.md)
 
 ---
 
 ## Must-Haves (from SPEC)
 
-- [ ] `MoneyRequest` Mongoose schema with status state machine (`PENDING`, `PAID`, `DECLINED`, `CANCELLED`, `EXPIRED`) and compound indexes.
-- [ ] Protected endpoints under `/api/v1/requests`: create, incoming, outgoing, getById, decline, cancel, and pay.
+- [x] `MoneyRequest` Mongoose schema with status state machine (`PENDING`, `PAID`, `DECLINED`, `CANCELLED`, `EXPIRED`) and compound indexes.
+- [x] Protected endpoints under `/api/v1/requests`: create, incoming, outgoing, getById, decline, cancel, and pay.
 - [ ] Double-lock pay execution: `Idempotency-Key` replay protection + atomic `status: "PENDING"` state condition.
 - [ ] Atomic money transfer inside a single session transaction: daily limit check, wallet debit, wallet credit, `TRANSFER` transaction, and double-entry ledger rows.
 - [ ] Lazy expiry: expired requests reject actions with HTTP `410` and auto-transition to `EXPIRED` in list queries without cron jobs.
@@ -60,7 +60,7 @@ updated: 2026-10-29T12:52:00.000Z
 ---
 
 ### Phase 3: Decline and Cancel State Transitions (Level 2 / D2)
-**Status:** ⬜ Not Started  
+**Status:** ✅ Complete  
 **Objective:** Implement atomic, single-step status transitions for declining requests (`POST /requests/:id/decline`) and cancelling requests (`POST /requests/:id/cancel`).  
 **Depends on:** Phase 2
 
