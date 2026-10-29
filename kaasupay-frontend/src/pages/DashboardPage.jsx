@@ -29,6 +29,7 @@ import { Skeleton } from '../components/ui/Spinner';
 import { formatDateTime } from '../utils/currency';
 import DailyLimitCard from '../components/security/DailyLimitCard';
 import SetPinModal from '../components/security/SetPinModal';
+import MoneyRequestsSection from '../components/requests/MoneyRequestsSection';
 
 export function DashboardPage() {
   const dispatch = useAppDispatch();
@@ -199,6 +200,11 @@ export function DashboardPage() {
       {/* Daily Outgoing Limit Tracker Card */}
       <motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4, delay: 0.1 }}>
         <DailyLimitCard />
+      </motion.div>
+
+      {/* Day 7 Request Money Section (Incoming & Outgoing Inboxes + Request Modal) */}
+      <motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4, delay: 0.15 }}>
+        <MoneyRequestsSection />
       </motion.div>
 
       {/* Profile & Recent Transactions Grid */}

@@ -161,6 +161,98 @@ export const walletService = {
     const response = await apiClient.get('/api/v1/wallet/limits');
     return response.data;
   },
+
+  // ---------------------------------------------------------------------------
+  // Day 7: Request Money Operations
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Create a new money request (ask someone for money)
+   * @param {{ to: string, amount: number, note?: string }} params - amount in paise
+   * @returns {Promise<{ message: string, request: { id: string, to: string, amount: number, note?: string, status: string, expiresAt: string } }>}
+   */
+  async createMoneyRequest({ to, amount, note }) {
+    const payload = { to, amount };
+    if (note && note.trim().length > 0) {
+      payload.note = note.trim();
+    }
+    const response = await apiClient.post('/api/v1/requests', payload);
+    return response.data;
+  },
+
+  /**
+   * Fetch incoming money requests where user is the payer
+   * @param {string} [status] - Optional filter ('PENDING', 'PAID', etc.)
+   * @returns {Promise<{ requests: Array<{ id: string, from: string, amount: number, note?: string, status: string, createdAt: string, expiresAt: string }> }>}
+   */
+  async getIncomingRequests(status) {
+    const params = status ? { status } : {};
+    const response = await apiClient.get('/api/v1/requests/incoming', { params });
+    return response.data;
+  },
+
+  /**
+   * Fetch outgoing money requests created by this user
+   * @param {string} [status] - Optional filter ('PENDING', 'PAID', etc.)
+   * @returns {Promise<{ requests: Array<{ id: string, to: string, amount: number, note?: string, status: string, createdAt: string, expiresAt: string }> }>}
+   */
+  async getOutgoingRequests(status) {
+    const params = status ? { status } : {};
+    const response = await apiClient.get('/api/v1/requests/outgoing', { params });
+    return response.data;
+  },
+
+  /**
+   * Retrieve single request by ID
+   * @param {string} id
+   * @returns {Promise<{ request: { id: string, from: string, to: string, amount: number, note?: string, status: string, createdAt: string, expiresAt: string } }>}
+   */
+  async getRequestById(id) {
+    const response = await apiClient.get(`/api/v1/requests/${id}`);
+    return response.data;
+  },
+
+  /**
+   * Decline an incoming money request (payer only)
+   * @param {string} id
+   * @returns {Promise<{ message: string }>}
+   */
+  async declineMoneyRequest(id) {
+    const response = await apiClient.post(`/api/v1/requests/${id}/decline`);
+    return response.data;
+  },
+
+  /**
+   * Cancel an outgoing money request (requester only)
+   * @param {string} id
+   * @returns {Promise<{ message: string }>}
+   */
+  async cancelMoneyRequest(id) {
+    const response = await apiClient.post(`/api/v1/requests/${id}/cancel`);
+    return response.data;
+  },
+
+  /**
+   * Pay an incoming money request with PIN and Idempotency protection (payer only)
+   * @param {string} id
+   * @param {{ pin: string, idempotencyKey: string }} params
+   * @returns {Promise<{ message: string, transactionId: string, balance: number }>}
+   */
+  async payMoneyRequest(id, { pin, idempotencyKey }) {
+    if (!idempotencyKey) {
+      throw new Error('Idempotency key is required to pay a request');
+    }
+    const response = await apiClient.post(
+      `/api/v1/requests/${id}/pay`,
+      { pin },
+      {
+        headers: {
+          'Idempotency-Key': idempotencyKey,
+        },
+      }
+    );
+    return response.data;
+  },
 };
 
 export default walletService;
