@@ -239,3 +239,153 @@ export async function getRequestById(req, res) {
     return res.status(500).json({ error: "Internal Server Error" });
   }
 }
+
+/**
+ * POST /api/v1/requests/:id/decline
+ * Moves request from PENDING to DECLINED (Payer only).
+ * Performs atomic conditional update with { returnDocument: "after" }.
+ */
+export async function declineRequest(req, res) {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(404).json({ message: "Request not found" });
+    }
+
+    const now = new Date();
+
+    // Atomic state transition: Only the payer can decline a PENDING non-expired request.
+    const updated = await MoneyRequest.findOneAndUpdate(
+      {
+        _id: id,
+        payerId: req.userId,
+        status: "PENDING",
+        expiresAt: { $gt: now },
+      },
+      {
+        $set: {
+          status: "DECLINED",
+          decidedAt: now,
+        },
+      },
+      { returnDocument: "after" }
+    );
+
+    if (updated) {
+      return res.status(200).json({ message: "Request declined" });
+    }
+
+    // Atomic update returned null. Read once to build specific response.
+    const existing = await MoneyRequest.findById(id);
+    if (!existing) {
+      return res.status(404).json({ message: "Request not found" });
+    }
+
+    const reqUserStr = req.userId.toString();
+    const requesterStr = existing.requesterId.toString();
+    const payerStr = existing.payerId.toString();
+
+    // Stranger isolation (never leak request existence to third parties).
+    if (reqUserStr !== requesterStr && reqUserStr !== payerStr) {
+      return res.status(404).json({ message: "Request not found" });
+    }
+
+    // Role check: requester trying to decline.
+    if (reqUserStr === requesterStr) {
+      return res.status(403).json({
+        message: "Only the person asked can decline this request",
+        error: "Only the person asked can decline this request",
+      });
+    }
+
+    // Expiry check.
+    if (existing.expiresAt <= now) {
+      return res.status(410).json({ message: "This request has expired" });
+    }
+
+    // Already decided state.
+    return res.status(409).json({
+      message: `This request is already ${existing.status}`,
+      error: `This request is already ${existing.status}`,
+    });
+  } catch (err) {
+    console.error("[declineRequest Error]", err);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
+}
+
+/**
+ * POST /api/v1/requests/:id/cancel
+ * Moves request from PENDING to CANCELLED (Requester only).
+ * Performs atomic conditional update with { returnDocument: "after" }.
+ */
+export async function cancelRequest(req, res) {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(404).json({ message: "Request not found" });
+    }
+
+    const now = new Date();
+
+    // Atomic state transition: Only the requester can cancel a PENDING non-expired request.
+    const updated = await MoneyRequest.findOneAndUpdate(
+      {
+        _id: id,
+        requesterId: req.userId,
+        status: "PENDING",
+        expiresAt: { $gt: now },
+      },
+      {
+        $set: {
+          status: "CANCELLED",
+          decidedAt: now,
+        },
+      },
+      { returnDocument: "after" }
+    );
+
+    if (updated) {
+      return res.status(200).json({ message: "Request cancelled" });
+    }
+
+    // Atomic update returned null. Read once to build specific response.
+    const existing = await MoneyRequest.findById(id);
+    if (!existing) {
+      return res.status(404).json({ message: "Request not found" });
+    }
+
+    const reqUserStr = req.userId.toString();
+    const requesterStr = existing.requesterId.toString();
+    const payerStr = existing.payerId.toString();
+
+    // Stranger isolation (never leak request existence to third parties).
+    if (reqUserStr !== requesterStr && reqUserStr !== payerStr) {
+      return res.status(404).json({ message: "Request not found" });
+    }
+
+    // Role check: payer trying to cancel.
+    if (reqUserStr === payerStr) {
+      return res.status(403).json({
+        message: "Only the requester can cancel this request",
+        error: "Only the requester can cancel this request",
+      });
+    }
+
+    // Expiry check.
+    if (existing.expiresAt <= now) {
+      return res.status(410).json({ message: "This request has expired" });
+    }
+
+    // Already decided state.
+    return res.status(409).json({
+      message: `This request is already ${existing.status}`,
+      error: `This request is already ${existing.status}`,
+    });
+  } catch (err) {
+    console.error("[cancelRequest Error]", err);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
+}
