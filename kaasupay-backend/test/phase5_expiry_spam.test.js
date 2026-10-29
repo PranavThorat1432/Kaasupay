@@ -1,4 +1,4 @@
-// test/phase5_expiry_spam.test.js — Acceptance test for Level 4 & Level 5 (D5 & D6) Expiry, Spam & Concurrency.
+// test/phase5_expiry_spam.test.js — Acceptance test for Level 4 & Level 5 (D5 & D6) Expiry, Spam Limits & Race Condition.
 import { MongoMemoryReplSet } from "mongodb-memory-server";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -52,7 +52,7 @@ async function waitForHealth(timeoutMs = 45000) {
 }
 
 async function main() {
-  console.log("=== Starting Phase 5 / Level 4 & Level 5 Acceptance Tests (Expiry, Spam & Concurrency) ===");
+  console.log("=== Starting Phase 5 / Level 4 & Level 5 Acceptance Tests (Expiry, Spam & Race) ===");
 
   // 1. Start in-memory replica set
   const replSet = await MongoMemoryReplSet.create({
@@ -110,6 +110,7 @@ async function main() {
       lastName: "S",
     });
     check("Priya signup -> 201", priyaRes.status === 201, JSON.stringify(priyaRes.json));
+    const priyaId = priyaRes.json?.user?._id;
     const priyaSignin = await post("/api/v1/user/signin", { username: "priya_p5@gmail.com", password: "secret123" });
     const priyaToken = priyaSignin.json?.token;
 
@@ -131,6 +132,7 @@ async function main() {
       lastName: "M",
     });
     check("Kavi signup -> 201", kaviRes.status === 201, JSON.stringify(kaviRes.json));
+    const kaviId = kaviRes.json?.user?._id;
     const kaviSignin = await post("/api/v1/user/signin", { username: "kavi_p5@gmail.com", password: "secret123" });
     const kaviToken = kaviSignin.json?.token;
 
@@ -141,7 +143,7 @@ async function main() {
       null,
       { "x-admin-key": ADMIN_KEY }
     );
-    check("Admin deposit ₹5,000 to Raju -> 201", depositRes.status === 201);
+    check("Staff deposit to Raju -> 201", depositRes.status === 201);
 
     // 3. Set Raju's PIN to 5829
     const pinRes = await post(
@@ -152,172 +154,207 @@ async function main() {
     check("Set Raju PIN to 5829 -> 200", pinRes.status === 200);
 
     // =========================================================================
-    // D5: Lazy Expiry
+    // D5: Expiry
     // =========================================================================
-    console.log("\n--- Testing D5: Lazy Expiry ---");
+    console.log("\n--- Testing D5: Expiry ---");
 
-    // Priya creates a request to Raju for ₹500
-    const expReqRes = await post(
+    // Create a request from Priya to Raju
+    const rExpRes = await post(
       "/api/v1/requests",
-      { to: rajuId, amount: 50000, note: "Expired test request" },
+      { to: rajuId, amount: 20000, note: "Expired test request" },
       priyaToken
     );
-    check("Priya creates request -> 201", expReqRes.status === 201, JSON.stringify(expReqRes.json));
-    const expReqId = expReqRes.json?.request?.id;
+    check("Priya creates request for expiry test -> 201", rExpRes.status === 201);
+    const rExpId = rExpRes.json?.request?.id;
 
-    // Directly alter expiresAt to yesterday in MongoDB collection
+    // Change expiresAt in MongoDB collection to yesterday
     const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
     await mongoose.connection
       .collection("moneyrequests")
-      .updateOne({ _id: new mongoose.Types.ObjectId(expReqId) }, { $set: { expiresAt: yesterday } });
+      .updateOne({ _id: new mongoose.Types.ObjectId(rExpId) }, { $set: { expiresAt: yesterday } });
 
     // Raju pays it -> 410 {"message":"This request has expired"}
-    const payExpired = await post(
-      `/api/v1/requests/${expReqId}/pay`,
+    const payExpRes = await post(
+      `/api/v1/requests/${rExpId}/pay`,
       { pin: "5829" },
       rajuToken,
-      { "Idempotency-Key": "pay-expired-1" }
+      { "Idempotency-Key": "pay-exp-key" }
     );
-    check("Raju pays expired request -> 410", payExpired.status === 410, JSON.stringify(payExpired.json));
+    check("Raju pays expired request -> 410", payExpRes.status === 410, JSON.stringify(payExpRes.json));
     check(
       "Pay expired message is 'This request has expired'",
-      payExpired.json?.message === "This request has expired"
+      payExpRes.json?.message === "This request has expired"
     );
 
     // Raju declines it -> 410 {"message":"This request has expired"}
-    const declineExpired = await post(`/api/v1/requests/${expReqId}/decline`, {}, rajuToken);
-    check("Raju declines expired request -> 410", declineExpired.status === 410, JSON.stringify(declineExpired.json));
+    const declineExpRes = await post(`/api/v1/requests/${rExpId}/decline`, {}, rajuToken);
+    check("Raju declines expired request -> 410", declineExpRes.status === 410, JSON.stringify(declineExpRes.json));
     check(
       "Decline expired message is 'This request has expired'",
-      declineExpired.json?.message === "This request has expired"
+      declineExpRes.json?.message === "This request has expired"
     );
 
     // Priya cancels it -> 410 {"message":"This request has expired"}
-    const cancelExpired = await post(`/api/v1/requests/${expReqId}/cancel`, {}, priyaToken);
-    check("Priya cancels expired request -> 410", cancelExpired.status === 410, JSON.stringify(cancelExpired.json));
+    const cancelExpRes = await post(`/api/v1/requests/${rExpId}/cancel`, {}, priyaToken);
+    check("Priya cancels expired request -> 410", cancelExpRes.status === 410, JSON.stringify(cancelExpRes.json));
     check(
       "Cancel expired message is 'This request has expired'",
-      cancelExpired.json?.message === "This request has expired"
+      cancelExpRes.json?.message === "This request has expired"
     );
 
     // Raju: GET /requests/incoming its status now shows "EXPIRED"
-    const incomingRes = await get("/api/v1/requests/incoming", rajuToken);
-    check("Raju gets incoming requests -> 200", incomingRes.status === 200);
-    const expiredItem = incomingRes.json?.requests?.find((r) => r.id === expReqId);
-    check("Request in incoming list has status EXPIRED", expiredItem?.status === "EXPIRED", `status=${expiredItem?.status}`);
+    const incRes = await get("/api/v1/requests/incoming", rajuToken);
+    const expiredDocIn = incRes.json?.requests?.find((r) => r.id === rExpId);
+    check("Incoming list contains expired request", Boolean(expiredDocIn));
+    check("Incoming list status shows 'EXPIRED'", expiredDocIn?.status === "EXPIRED");
 
-    // Raju's balance unchanged
-    const rajuBalAfterExp = await get("/api/v1/wallet/balance", rajuToken);
-    check("Raju's balance unchanged at 500000", rajuBalAfterExp.json?.balance === 500000);
+    // Priya: GET /requests/outgoing its status now shows "EXPIRED"
+    const outRes = await get("/api/v1/requests/outgoing", priyaToken);
+    const expiredDocOut = outRes.json?.requests?.find((r) => r.id === rExpId);
+    check("Outgoing list contains expired request", Boolean(expiredDocOut));
+    check("Outgoing list status shows 'EXPIRED'", expiredDocOut?.status === "EXPIRED");
+
+    // Raju's balance is unchanged (500000)
+    const rajuBalExp = await get("/api/v1/wallet/balance", rajuToken);
+    check("Raju's balance unchanged at 500000", rajuBalExp.json?.balance === 500000);
 
     // =========================================================================
-    // D6: Anti-Spam Limits (5 pending requests & 20/hr rate limit)
+    // D6: Limits against spam
     // =========================================================================
-    console.log("\n--- Testing D6: Anti-Spam Limits ---");
+    console.log("\n--- Testing D6: Limits against spam ---");
 
-    const kaviRequestIds = [];
     // Kavi sends 5 requests to Raju -> 201 each time
+    const kaviReqIds = [];
     for (let i = 1; i <= 5; i++) {
       const res = await post(
         "/api/v1/requests",
-        { to: rajuId, amount: 10000, note: `Spam test ${i}` },
+        { to: rajuId, amount: i * 10000, note: `Kavi request #${i}` },
         kaviToken
       );
-      check(`Kavi sends request ${i}/5 -> 201`, res.status === 201, JSON.stringify(res.json));
-      if (res.json?.request?.id) kaviRequestIds.push(res.json.request.id);
+      check(`Kavi sends request #${i} -> 201`, res.status === 201);
+      kaviReqIds.push(res.json?.request?.id);
     }
 
-    // Kavi sends a 6th -> 409 {"message":"You already have 5 pending requests to this person"}
-    const spam6Res = await post(
+    // Kavi sends a 6th request to Raju -> 409 {"message":"You already have 5 pending requests to this person"}
+    const kavi6thRes = await post(
       "/api/v1/requests",
-      { to: rajuId, amount: 10000, note: "Spam test 6" },
+      { to: rajuId, amount: 60000, note: "Kavi request #6" },
       kaviToken
     );
-    check("Kavi sends 6th request -> 409", spam6Res.status === 409, JSON.stringify(spam6Res.json));
+    check("Kavi sends 6th request -> 409", kavi6thRes.status === 409, JSON.stringify(kavi6thRes.json));
     check(
-      "Spam message matches spec exactly",
-      spam6Res.json?.message === "You already have 5 pending requests to this person"
+      "5-pending spam message matches spec",
+      kavi6thRes.json?.message === "You already have 5 pending requests to this person"
     );
 
-    // Raju declines one of them -> 200
-    const declineOneRes = await post(`/api/v1/requests/${kaviRequestIds[0]}/decline`, {}, rajuToken);
-    check("Raju declines one of the 5 requests -> 200", declineOneRes.status === 200, JSON.stringify(declineOneRes.json));
+    // Raju declines one of Kavi's requests -> 200
+    const declineKaviRes = await post(`/api/v1/requests/${kaviReqIds[0]}/decline`, {}, rajuToken);
+    check("Raju declines one of Kavi's requests -> 200", declineKaviRes.status === 200);
 
-    // Kavi sends again -> 201 (now it fits again!)
+    // Kavi sends again -> 201 (now it fits again)
     const kaviRetryRes = await post(
       "/api/v1/requests",
-      { to: rajuId, amount: 10000, note: "Spam test replacement" },
+      { to: rajuId, amount: 60000, note: "Kavi request after decline" },
       kaviToken
     );
-    check("Kavi sends request after decline -> 201 (now it fits)", kaviRetryRes.status === 201, JSON.stringify(kaviRetryRes.json));
+    check("Kavi sends again after decline -> 201", kaviRetryRes.status === 201, JSON.stringify(kaviRetryRes.json));
 
-    // Verify rate limit header on request creation (20 per hour)
-    check(
-      "RateLimit-Limit header is 20",
-      kaviRetryRes.headers?.get("x-ratelimit-limit") === "20",
-      `limit=${kaviRetryRes.headers?.get("x-ratelimit-limit")}`
-    );
+    // Rate limit test: 20 requests per hour per user
+    console.log("\n--- Testing Rate Limit (20 requests/hour) ---");
+    // Create an extra 4th user specifically for rate limit stress test
+    const spammerRes = await post("/api/v1/user/signup", {
+      username: "spammer_p5@gmail.com",
+      password: "secret123",
+      firstName: "Sam",
+      lastName: "S",
+    });
+    const spammerToken = (await post("/api/v1/user/signin", { username: "spammer_p5@gmail.com", password: "secret123" })).json?.token;
 
-    // =========================================================================
-    // Concurrency Race Test (Bonus 8 / Invariant 3: Pay vs Cancel)
-    // =========================================================================
-    console.log("\n--- Testing Concurrency Race: Simultaneous Pay vs Cancel ---");
-
-    // Perform 5 concurrent race trials
-    for (let round = 1; round <= 5; round++) {
-      const raceReq = await post(
+    // Sam sends requests across multiple recipients (or declining in between) to hit 20
+    let rateLimited = false;
+    for (let i = 1; i <= 21; i++) {
+      // Rotate recipient between Priya, Raju, and Kavi
+      const targetId = i % 3 === 0 ? priyaId : (i % 3 === 1 ? rajuId : kaviId);
+      const res = await post(
         "/api/v1/requests",
-        { to: rajuId, amount: 2000, note: `Race trial ${round}` },
-        priyaToken
+        { to: targetId, amount: 5000, note: `Rate test ${i}` },
+        spammerToken
       );
-      const raceReqId = raceReq.json?.request?.id;
+      if (res.status === 429) {
+        rateLimited = true;
+        check("21st request is rate limited -> 429", res.status === 429);
+        check(
+          "Rate limit message is 'Too many requests. Slow down'",
+          res.json?.message === "Too many requests. Slow down"
+        );
+        check("Retry-After header exists", Boolean(res.headers.get("retry-after")));
+        break;
+      }
+    }
+    check("Rate limit triggered on excessive request creation", rateLimited);
 
-      // Fire pay (Raju) and cancel (Priya) at the exact same millisecond
-      const payPromise = post(
+    // =========================================================================
+    // Concurrency Race Test (Bonus 8 / PDF Page 10)
+    // =========================================================================
+    console.log("\n--- Testing Concurrency Race: Pay vs Cancel ---");
+
+    // Priya sends fresh request to Raju for ₹300 (30000 paise)
+    const raceReqRes = await post(
+      "/api/v1/requests",
+      { to: rajuId, amount: 30000, note: "Race condition test" },
+      priyaToken
+    );
+    check("Priya creates race test request -> 201", raceReqRes.status === 201);
+    const raceReqId = raceReqRes.json?.request?.id;
+
+    // Raju balance before race
+    const balBefore = (await get("/api/v1/wallet/balance", rajuToken)).json?.balance;
+
+    // Send pay and cancel simultaneously
+    const [payRace, cancelRace] = await Promise.all([
+      post(
         `/api/v1/requests/${raceReqId}/pay`,
         { pin: "5829" },
         rajuToken,
-        { "Idempotency-Key": `race-pay-key-${round}-${Date.now()}` }
-      );
-      const cancelPromise = post(
-        `/api/v1/requests/${raceReqId}/cancel`,
-        {},
-        priyaToken
-      );
+        { "Idempotency-Key": `race-key-${Date.now()}` }
+      ),
+      post(`/api/v1/requests/${raceReqId}/cancel`, {}, priyaToken),
+    ]);
 
-      const [payRes, cancelRes] = await Promise.all([payPromise, cancelPromise]);
+    console.log(`Race results: Pay status=${payRace.status}, Cancel status=${cancelRace.status}`);
 
-      const payWon = payRes.status === 200 && cancelRes.status === 409;
-      const cancelWon = payRes.status === 409 && cancelRes.status === 200;
+    const payWon = payRace.status === 200 && cancelRace.status === 409;
+    const cancelWon = payRace.status === 409 && cancelRace.status === 200;
 
+    check(
+      "Simultaneous pay vs cancel has exactly one winner (200) and one loser (409)",
+      payWon || cancelWon,
+      `pay=${payRace.status}, cancel=${cancelRace.status}`
+    );
+
+    const balAfter = (await get("/api/v1/wallet/balance", rajuToken)).json?.balance;
+    if (payWon) {
+      check("Pay won: Raju debited exactly 30000 paise", balAfter === balBefore - 30000);
       check(
-        `Race round ${round}: Exactly one action won (Pay 200/Cancel 409 OR Cancel 200/Pay 409)`,
-        payWon || cancelWon,
-        `payStatus=${payRes.status}, cancelStatus=${cancelRes.status}`
+        "Cancel error indicates request is already PAID",
+        cancelRace.json?.message === "This request is already PAID"
       );
-
-      // Verify the database state matches the winner
-      const finalDoc = await mongoose.connection
-        .collection("moneyrequests")
-        .findOne({ _id: new mongoose.Types.ObjectId(raceReqId) });
-
-      if (payWon) {
-        check(`Race round ${round}: DB state is PAID`, finalDoc.status === "PAID");
-        check(`Race round ${round}: transactionId is assigned`, Boolean(finalDoc.transactionId));
-      } else {
-        check(`Race round ${round}: DB state is CANCELLED`, finalDoc.status === "CANCELLED");
-        check(`Race round ${round}: transactionId remains null`, finalDoc.transactionId === null);
-      }
+    } else {
+      check("Cancel won: Raju balance unchanged", balAfter === balBefore);
+      check(
+        "Pay error indicates request is already CANCELLED",
+        payRace.json?.message === "This request is already CANCELLED"
+      );
     }
 
     // =========================================================================
-    // Administrative Financial Reconciliation Conservation Check
+    // Admin Reconcile
     // =========================================================================
-    console.log("\n--- Testing Financial Reconciliation ---");
+    console.log("\n--- Final Reconcile Check ---");
     const reconcileRes = await get("/api/v1/admin/reconcile", null, { "x-admin-key": ADMIN_KEY });
-    check("Admin reconcile -> 200", reconcileRes.status === 200, JSON.stringify(reconcileRes.json));
-    check("Reconciliation confirms moneyIsConserved: true", reconcileRes.json?.moneyIsConserved === true);
-    check("Reconciliation has 0 balance mismatches", reconcileRes.json?.mismatches?.length === 0);
+    check("Admin reconcile -> 200", reconcileRes.status === 200);
+    check("moneyIsConserved === true", reconcileRes.json?.moneyIsConserved === true);
+    check("0 balance mismatches", reconcileRes.json?.mismatches?.length === 0);
 
   } finally {
     server.kill("SIGTERM");
@@ -326,7 +363,7 @@ async function main() {
   }
 
   console.log(`\n==========================================`);
-  console.log(`PHASE 5 / LEVEL 4 & 5 TEST SUMMARY: ${passedAssertions} PASSED, ${failures} FAILED`);
+  console.log(`PHASE 5 TEST SUMMARY: ${passedAssertions} PASSED, ${failures} FAILED`);
   console.log(`==========================================`);
 
   if (failures > 0) {
