@@ -44,7 +44,7 @@ updated: 2026-10-29T12:52:00.000Z
 ---
 
 ### Phase 2: Request Creation & Inbox Listing (Level 1 / D1)
-**Status:** ⬜ Not Started  
+**Status:** ✅ Complete  
 **Objective:** Implement request creation (`POST /requests`), incoming/outgoing listing (`GET /requests/incoming`, `GET /requests/outgoing`), and single request retrieval (`GET /requests/:id`).  
 **Depends on:** Phase 1
 
