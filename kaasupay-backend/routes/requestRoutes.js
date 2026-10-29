@@ -7,9 +7,10 @@ import {
   getRequestById,
   declineRequest,
   cancelRequest,
+  payRequest,
 } from "../controllers/requestController.js";
 import { requireAuth } from "../middleware/authMiddleware.js";
-import { rateLimit } from "../middleware/rateLimiter.js";
+import { rateLimit, moneyRateLimiter } from "../middleware/rateLimiter.js";
 
 const router = express.Router();
 
@@ -28,5 +29,6 @@ router.get("/outgoing", requireAuth, getOutgoingRequests);
 router.get("/:id", requireAuth, getRequestById);
 router.post("/:id/decline", requireAuth, declineRequest);
 router.post("/:id/cancel", requireAuth, cancelRequest);
+router.post("/:id/pay", requireAuth, moneyRateLimiter, payRequest);
 
 export default router;
