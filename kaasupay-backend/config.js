@@ -80,4 +80,5 @@ export function validateApiConfig() {
   }
 }
 
-
+// Request Money expiry duration in days (Day 7: default 7 days)
+export const REQUEST_EXPIRY_DAYS = Number(process.env.REQUEST_EXPIRY_DAYS) || 7;
