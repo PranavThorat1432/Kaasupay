@@ -57,6 +57,21 @@ export async function createRequest(req, res) {
       });
     }
 
+    const now = new Date();
+
+    // Lazy expiration: mark overdue pending requests between requester and target payer as EXPIRED
+    await MoneyRequest.updateMany(
+      {
+        requesterId: req.userId,
+        payerId: to,
+        status: "PENDING",
+        expiresAt: { $lte: now },
+      },
+      {
+        $set: { status: "EXPIRED" },
+      }
+    );
+
     // Anti-spam rule (Day 7 PDF Level 5): At most 5 pending requests to the same person.
     const pendingCount = await MoneyRequest.countDocuments({
       requesterId: req.userId,
