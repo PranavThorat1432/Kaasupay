@@ -6,8 +6,8 @@ updated: 2026-10-29T12:52:00.000Z
 
 # Roadmap: Day 7 Request Money
 
-> **Current Phase:** Phase 4 - Atomic Payment Execution & Financial Settlement
-> **Status:** Phase 3 Completed. Ready for Phase 4.
+> **Current Phase:** Phase 5 - Lazy Expiration & Anti-Spam Limits
+> **Status:** Phase 4 Completed. Ready for Phase 5.
 > **Specification:** [.gsd/SPEC.md](file:///c:/Users/hp/Desktop/Sure%20Trust/KaasuPay%20Application/.gsd/SPEC.md)
 
 ---
@@ -16,8 +16,8 @@ updated: 2026-10-29T12:52:00.000Z
 
 - [x] `MoneyRequest` Mongoose schema with status state machine (`PENDING`, `PAID`, `DECLINED`, `CANCELLED`, `EXPIRED`) and compound indexes.
 - [x] Protected endpoints under `/api/v1/requests`: create, incoming, outgoing, getById, decline, cancel, and pay.
-- [ ] Double-lock pay execution: `Idempotency-Key` replay protection + atomic `status: "PENDING"` state condition.
-- [ ] Atomic money transfer inside a single session transaction: daily limit check, wallet debit, wallet credit, `TRANSFER` transaction, and double-entry ledger rows.
+- [x] Double-lock pay execution: `Idempotency-Key` replay protection + atomic `status: "PENDING"` state condition.
+- [x] Atomic money transfer inside a single session transaction: daily limit check, wallet debit, wallet credit, `TRANSFER` transaction, and double-entry ledger rows.
 - [ ] Lazy expiry: expired requests reject actions with HTTP `410` and auto-transition to `EXPIRED` in list queries without cron jobs.
 - [ ] Anti-spam protection: maximum 5 pending requests to the same payer (409) and 20/hr request creation rate limit.
 - [ ] Automated test suite `test/day7.test.js` covering test matrix D1–D6 and concurrency race conditions.
@@ -77,7 +77,7 @@ updated: 2026-10-29T12:52:00.000Z
 ---
 
 ### Phase 4: Atomic Payment Execution & Financial Settlement (Level 3 / D3 & D4)
-**Status:** ⬜ Not Started  
+**Status:** ✅ Complete  
 **Objective:** Implement `POST /requests/:id/pay` with PIN verification, idempotency replay, and single-transaction money movement.  
 **Depends on:** Phase 3
 
