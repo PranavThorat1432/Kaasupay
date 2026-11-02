@@ -196,7 +196,7 @@ export function RequestMoneyModal({ isOpen, onClose, onRequestCreated }) {
 
           {/* Autocomplete Dropdown */}
           {showDropdown && searchResults.length > 0 && !selectedRecipient && (
-            <div className="absolute z-50 left-0 right-0 mt-1.5 bg-white rounded-xl border border-slate-200 shadow-lg max-h-52 overflow-y-auto divide-y divide-slate-100">
+            <div className="absolute z-50 left-0 right-0 mt-1.5 bg-white rounded-xl border border-slate-200 shadow-lg max-h-52 overflow-y-auto divide-y">
               {searchResults.map((u) => (
                 <button
                   key={u._id}
