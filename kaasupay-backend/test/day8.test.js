@@ -6,6 +6,8 @@ import path from "node:path";
 import "dotenv/config";
 import mongoose from "mongoose";
 import LedgerEntry from "../models/ledgerEntryModel.js";
+import Transaction from "../models/transactionModel.js";
+import { runBackfill } from "../tools/backfill-ledger-type.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PORT = 3124;
@@ -428,6 +430,219 @@ async function main() {
     check("Legacy response has 'data' array", Array.isArray(legacyHistory.json?.data));
     check("Legacy response has 'transactions' array", Array.isArray(legacyHistory.json?.transactions));
 
+    // =========================================================================
+    // LEVEL 2 — Denormalization, Backfill & History Filters
+    // =========================================================================
+    console.log("\n--- Level 2: Denormalization on New Records ---");
+
+    // Verify deposits created in Phase 1 already have type: "DEPOSIT"
+    const sampleEntry = await LedgerEntry.findOne({ userId: meenaSignup.json.user._id, direction: "CREDIT" });
+    check("Deposit LedgerEntry contains type: 'DEPOSIT'", sampleEntry?.type === "DEPOSIT", `got: ${sampleEntry?.type}`);
+
+    // Set PIN for Meena to perform a transfer
+    const pinRes = await post(
+      "/api/v1/user/pin",
+      { pin: "5829", password: "Password123!" },
+      { Authorization: `Bearer ${meenaToken}` }
+    );
+    check("Meena sets payment PIN -> 200", pinRes.status === 200, JSON.stringify(pinRes));
+
+    // Perform transfer from Meena to Stranger
+    const transferRes = await post(
+      "/api/v1/wallet/transfer",
+      {
+        to: "stranger@kaasupay.com",
+        amount: 2500,
+        note: "Testing transfer type denormalization",
+        pin: "5829",
+      },
+      {
+        Authorization: `Bearer ${meenaToken}`,
+        "Idempotency-Key": "xfer-day8-phase2-001",
+      }
+    );
+    check("Meena transfers ₹25 to Stranger -> 200", transferRes.status === 200, JSON.stringify(transferRes));
+
+    // Check DEBIT and CREDIT ledger entries for the transfer
+    const xferDebit = await LedgerEntry.findOne({
+      userId: meenaSignup.json.user._id,
+      direction: "DEBIT",
+    });
+    check("Transfer DEBIT LedgerEntry contains type: 'TRANSFER'", xferDebit?.type === "TRANSFER", `got: ${xferDebit?.type}`);
+
+    const xferCredit = await LedgerEntry.findOne({
+      userId: strangerSignup.json.user._id,
+      direction: "CREDIT",
+    });
+    check("Transfer CREDIT LedgerEntry contains type: 'TRANSFER'", xferCredit?.type === "TRANSFER", `got: ${xferCredit?.type}`);
+
+    // -------------------------------------------------------------------------
+    // Backfill Script Idempotency Verification
+    // -------------------------------------------------------------------------
+    console.log("\n--- Level 2: Backfill Script Verification ---");
+
+    // Insert a dummy Transaction and a LedgerEntry lacking 'type'
+    const dummyTxn = await Transaction.create({
+      type: "TOPUP",
+      fromUserId: null,
+      toUserId: meenaSignup.json.user._id,
+      amount: 5000,
+      note: "Old legacy topup",
+      status: "COMPLETED",
+    });
+
+    const dummyEntry = await LedgerEntry.create({
+      userId: meenaSignup.json.user._id,
+      transactionId: dummyTxn._id,
+      direction: "CREDIT",
+      amount: 5000,
+      balanceAfter: 100000,
+      // No type field provided!
+    });
+    check("Created dummy entry without type", dummyEntry.type === undefined);
+
+    // Run backfill pass 1
+    const backfill1 = await runBackfill({ verbose: false });
+    check("Backfill pass 1 fixed at least 1 record", backfill1.fixed >= 1, `fixed: ${backfill1.fixed}`);
+
+    // Verify dummy entry was updated with original transaction's type
+    const updatedDummy = await LedgerEntry.findById(dummyEntry._id);
+    check("Dummy entry now has type 'TOPUP' after backfill", updatedDummy?.type === "TOPUP", `type: ${updatedDummy?.type}`);
+
+    // Run backfill pass 2 (Idempotency)
+    const backfill2 = await runBackfill({ verbose: false });
+    check("Backfill pass 2 fixed 0 rows (idempotent)", backfill2.fixed === 0, `fixed: ${backfill2.fixed}`);
+
+    // -------------------------------------------------------------------------
+    // Direction & Type Filter Tests
+    // -------------------------------------------------------------------------
+    console.log("\n--- Level 2: Direction & Type Filters ---");
+
+    // Invalid direction -> 400
+    const invDir = await get("/api/v1/wallet/history?direction=INVALID", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("Invalid direction returns 400", invDir.status === 400);
+
+    // Filter direction=DEBIT -> should only return the 1 transfer
+    const debitOnly = await get("/api/v1/wallet/history?direction=DEBIT", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("direction=DEBIT returns 200", debitOnly.status === 200);
+    check("direction=DEBIT returns only DEBIT items", debitOnly.json.items.every((it) => it.direction === "DEBIT"));
+    check("direction=DEBIT returns 1 item", debitOnly.json.items.length === 1);
+
+    // Filter direction=CREDIT -> should only return credits (deposits + backfilled topup)
+    const creditOnly = await get("/api/v1/wallet/history?direction=CREDIT&limit=50", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("direction=CREDIT returns 200", creditOnly.status === 200);
+    check("direction=CREDIT returns only CREDIT items", creditOnly.json.items.every((it) => it.direction === "CREDIT"));
+
+    // Invalid type -> 400
+    const invType = await get("/api/v1/wallet/history?type=INVALID", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("Invalid type returns 400", invType.status === 400);
+
+    // Filter type=TRANSFER -> returns only the transfer
+    const xferFilter = await get("/api/v1/wallet/history?type=TRANSFER", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("type=TRANSFER returns 200", xferFilter.status === 200);
+    check("type=TRANSFER returns 1 item", xferFilter.json.items.length === 1);
+    check("type=TRANSFER item type is 'TRANSFER'", xferFilter.json.items[0].type === "TRANSFER");
+
+    // Filter type=WITHDRAWAL -> 0 items
+    const wdrFilter = await get("/api/v1/wallet/history?type=WITHDRAWAL", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("type=WITHDRAWAL returns 200", wdrFilter.status === 200);
+    check("type=WITHDRAWAL returns 0 items for Meena", wdrFilter.json.items.length === 0);
+
+    // -------------------------------------------------------------------------
+    // India Standard Time (IST) Date Filtering Tests
+    // -------------------------------------------------------------------------
+    console.log("\n--- Level 2: India Standard Time Date Filtering ---");
+
+    // Today in IST
+    const nowIst = new Date(Date.now() + 5.5 * 3600000);
+    const todayIstStr = nowIst.toISOString().slice(0, 10);
+
+    // Invalid date formats -> 400
+    const badFrom = await get("/api/v1/wallet/history?from=not-a-date", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("Invalid from date returns 400", badFrom.status === 400);
+
+    const badTo = await get("/api/v1/wallet/history?to=2026-13-40", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("Invalid to date returns 400", badTo.status === 400);
+
+    // from after to -> 400
+    const invRange = await get("/api/v1/wallet/history?from=2026-11-20&to=2026-11-10", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("from after to returns 400", invRange.status === 400);
+    check("from after to error message matches", invRange.json.message === "from must not be after to");
+
+    // Filter with today IST range: should include today's activity
+    const todayFilter = await get(`/api/v1/wallet/history?from=${todayIstStr}&to=${todayIstStr}`, {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("Filtering by today IST returns 200", todayFilter.status === 200);
+    check("Today's records found in IST range", todayFilter.json.items.length > 0);
+
+    // Seed a transaction specifically at 23:59:00 IST on 2026-10-15 (18:29 UTC on 2026-10-15)
+    // 2026-10-15 23:59:00 IST = 2026-10-15T18:29:00.000Z
+    const lateEveningIst = new Date("2026-10-15T18:29:00.000Z");
+    const lateEntry = await LedgerEntry.create({
+      userId: meenaSignup.json.user._id,
+      transactionId: dummyTxn._id,
+      direction: "CREDIT",
+      type: "DEPOSIT",
+      amount: 7777,
+      balanceAfter: 107777,
+      createdAt: lateEveningIst,
+      updatedAt: lateEveningIst,
+    });
+    await LedgerEntry.updateOne({ _id: lateEntry._id }, { $set: { createdAt: lateEveningIst } });
+
+    // Filter strictly on 2026-10-15
+    const lateFilter = await get("/api/v1/wallet/history?from=2026-10-15&to=2026-10-15", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("Query 2026-10-15 includes transaction made at 23:59 IST", lateFilter.json.items.some((it) => it.id === lateEntry._id.toString()));
+
+    // Verify 2026-10-14 excludes this transaction
+    const beforeFilter = await get("/api/v1/wallet/history?from=2026-10-14&to=2026-10-14", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("Query 2026-10-14 excludes transaction made on 2026-10-15", !beforeFilter.json.items.some((it) => it.id === lateEntry._id.toString()));
+
+    // -------------------------------------------------------------------------
+    // Combined Filters & Pagination
+    // -------------------------------------------------------------------------
+    console.log("\n--- Level 2: Combined Filters & Cursor Pagination ---");
+
+    const combPage1 = await get("/api/v1/wallet/history?direction=CREDIT&type=DEPOSIT&limit=15", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("Combined filters page 1 returns 200", combPage1.status === 200);
+    check("Combined page 1 returns 15 items", combPage1.json.items.length === 15);
+    check("All page 1 items are CREDIT & DEPOSIT", combPage1.json.items.every((it) => it.direction === "CREDIT" && it.type === "DEPOSIT"));
+    check("Combined page 1 has nextCursor", Boolean(combPage1.json.nextCursor));
+
+    const combPage2 = await get(
+      `/api/v1/wallet/history?direction=CREDIT&type=DEPOSIT&limit=15&cursor=${combPage1.json.nextCursor}`,
+      { Authorization: `Bearer ${meenaToken}` }
+    );
+    check("Combined page 2 returns 200", combPage2.status === 200);
+    check("Combined page 2 returns 15 items", combPage2.json.items.length === 15);
+    check("All page 2 items are CREDIT & DEPOSIT", combPage2.json.items.every((it) => it.direction === "CREDIT" && it.type === "DEPOSIT"));
+    check("Combined page 2 has nextCursor", Boolean(combPage2.json.nextCursor));
+
   } finally {
     await mongoose.disconnect();
     server.kill("SIGTERM");
@@ -435,7 +650,7 @@ async function main() {
   }
 
   console.log("\n===============================================================================");
-  console.log(`=== DAY 8 PHASE 1 ACCEPTANCE SUITE: ${passedAssertions} PASSED, ${failures} FAILED ===`);
+  console.log(`=== DAY 8 PHASE 1 & 2 ACCEPTANCE SUITE: ${passedAssertions} PASSED, ${failures} FAILED ===`);
   console.log("===============================================================================");
 
   if (failures > 0) {

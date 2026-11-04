@@ -14,6 +14,7 @@ import IdempotencyRecord from "../models/idempotencyRecordModel.js";
 import { transfer as transferMoney, MoneyError, hashRequest } from "../services/money.js";
 import { verifyPin } from "../services/pinService.js";
 import { getDailyLimitStatus } from "../services/dailyLimitService.js";
+import { parseIstDateRange } from "../services/dateUtils.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -476,15 +477,51 @@ const getHistory = async (req, res) => {
       }
     }
 
-    // 3. Build query filter
+    // 3. Direction and Type filter validation (Day 8 Level 2)
+    const VALID_DIRECTIONS = ["DEBIT", "CREDIT"];
+    const VALID_TYPES = ["TRANSFER", "DEPOSIT", "TOPUP", "WITHDRAWAL", "REVERSAL"];
+
+    if (req.query.direction !== undefined) {
+      if (!VALID_DIRECTIONS.includes(req.query.direction)) {
+        return res.status(400).json({ error: "Invalid direction filter", message: "Invalid direction filter" });
+      }
+    }
+
+    if (req.query.type !== undefined) {
+      if (!VALID_TYPES.includes(req.query.type)) {
+        return res.status(400).json({ error: "Invalid type filter", message: "Invalid type filter" });
+      }
+    }
+
+    // 4. India Standard Time Date Range validation (Day 8 Level 2)
+    const { dateCondition, error: dateError } = parseIstDateRange(req.query.from, req.query.to);
+    if (dateError) {
+      return res.status(400).json({ error: dateError, message: dateError });
+    }
+
+    // 5. Build combined query filter using $and
+    const andClauses = [];
+    if (cursorCondition) {
+      andClauses.push(cursorCondition);
+    }
+    if (req.query.direction) {
+      andClauses.push({ direction: req.query.direction });
+    }
+    if (req.query.type) {
+      andClauses.push({ type: req.query.type });
+    }
+    if (dateCondition) {
+      andClauses.push(dateCondition);
+    }
+
     const query = {
       userId: req.userId,
     };
-    if (cursorCondition) {
-      query.$and = [cursorCondition];
+    if (andClauses.length > 0) {
+      query.$and = andClauses;
     }
 
-    // 4. Fetch limit + 1 items with populated transaction details
+    // 6. Fetch limit + 1 items with populated transaction details
     const entries = await LedgerEntry.find(query)
       .sort({ createdAt: -1, _id: -1 })
       .limit(limit + 1)

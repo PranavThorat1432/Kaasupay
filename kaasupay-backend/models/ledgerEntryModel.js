@@ -24,6 +24,11 @@ const ledgerEntrySchema = new mongoose.Schema(
       enum: ["DEBIT", "CREDIT"],
       required: [true, "direction is required"],
     },
+    // Denormalized transaction type (Day 8 Level 2)
+    type: {
+      type: String,
+      enum: ["TRANSFER", "DEPOSIT", "TOPUP", "WITHDRAWAL", "REVERSAL"],
+    },
     // Amount of this entry in paise. Always the absolute value (positive).
     amount: {
       type: Number,
