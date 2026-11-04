@@ -643,6 +643,33 @@ async function main() {
     check("All page 2 items are CREDIT & DEPOSIT", combPage2.json.items.every((it) => it.direction === "CREDIT" && it.type === "DEPOSIT"));
     check("Combined page 2 has nextCursor", Boolean(combPage2.json.nextCursor));
 
+    // =========================================================================
+    // LEVEL 3 — Compound Indexes and Query Optimization
+    // =========================================================================
+    console.log("\n--- Level 3: Compound Indexes Verification ---");
+
+    // Check schema indexes
+    const schemaIndexes = LedgerEntry.schema.indexes();
+    const hasMainCompound = schemaIndexes.some(([idx]) => idx.userId === 1 && idx.createdAt === -1 && idx._id === -1);
+    const hasTypeCompound = schemaIndexes.some(([idx]) => idx.userId === 1 && idx.type === 1 && idx.createdAt === -1 && idx._id === -1);
+    const hasTxnIndex = schemaIndexes.some(([idx]) => idx.transactionId === 1);
+
+    check("Compound index { userId: 1, createdAt: -1, _id: -1 } registered", hasMainCompound);
+    check("Compound index { userId: 1, type: 1, createdAt: -1, _id: -1 } registered", hasTypeCompound);
+    check("TransactionId index { transactionId: 1 } preserved", hasTxnIndex);
+
+    // Verify index usage with explain()
+    const explainPlan = await LedgerEntry.find({ userId: meenaSignup.json.user._id })
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(20)
+      .explain("executionStats");
+
+    const winningStage = explainPlan.queryPlanner.winningPlan.stage;
+    const totalExamined = explainPlan.executionStats.totalDocsExamined;
+
+    check("Explain plan does not use in-memory SORT stage", winningStage !== "SORT", `winningStage: ${winningStage}`);
+    check("Explain plan examined at most 20 documents for limit 20", totalExamined <= 20, `totalExamined: ${totalExamined}`);
+
   } finally {
     await mongoose.disconnect();
     server.kill("SIGTERM");
@@ -650,7 +677,7 @@ async function main() {
   }
 
   console.log("\n===============================================================================");
-  console.log(`=== DAY 8 PHASE 1 & 2 ACCEPTANCE SUITE: ${passedAssertions} PASSED, ${failures} FAILED ===`);
+  console.log(`=== DAY 8 PHASE 1, 2 & 3 ACCEPTANCE SUITE: ${passedAssertions} PASSED, ${failures} FAILED ===`);
   console.log("===============================================================================");
 
   if (failures > 0) {

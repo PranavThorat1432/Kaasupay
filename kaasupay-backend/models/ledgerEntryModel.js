@@ -51,9 +51,11 @@ const ledgerEntrySchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// Primary index for newest-first history queries: "give me all entries for
-// this user, newest first". This is the most common history access pattern.
-ledgerEntrySchema.index({ userId: 1, createdAt: -1 });
+// Primary compound index for cursor-paginated history (equality on userId, sort on createdAt DESC, _id DESC)
+ledgerEntrySchema.index({ userId: 1, createdAt: -1, _id: -1 });
+
+// Compound index for type-filtered cursor history (ESR rule: Equality on userId + type, Sort on createdAt DESC, _id DESC)
+ledgerEntrySchema.index({ userId: 1, type: 1, createdAt: -1, _id: -1 });
 
 // Secondary index for reconciliation: "all entries for a given transaction".
 ledgerEntrySchema.index({ transactionId: 1 });
