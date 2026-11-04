@@ -14,7 +14,7 @@ import IdempotencyRecord from "../models/idempotencyRecordModel.js";
 import { transfer as transferMoney, MoneyError, hashRequest } from "../services/money.js";
 import { verifyPin } from "../services/pinService.js";
 import { getDailyLimitStatus } from "../services/dailyLimitService.js";
-import { parseIstDateRange } from "../services/dateUtils.js";
+import { parseIstDateRange, parseIstMonthRange, isValidMonthStr } from "../services/dateUtils.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -600,6 +600,94 @@ const getHistory = async (req, res) => {
 };
 
 /**
+ * GET /api/v1/wallet/statement?month=YYYY-MM — Monthly financial statement (Day 8 Level 4)
+ */
+const getStatement = async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.userId)) {
+      return res.status(401).json({ error: "Unauthorized", message: "Unauthorized" });
+    }
+
+    const { month } = req.query;
+    if (!month || !isValidMonthStr(month)) {
+      return res.status(400).json({
+        error: "Invalid month format. Expected YYYY-MM (e.g. 2026-11)",
+        message: "Invalid month format. Expected YYYY-MM (e.g. 2026-11)",
+      });
+    }
+
+    const { start, end } = parseIstMonthRange(month);
+    const userObjectId = new mongoose.Types.ObjectId(req.userId);
+
+    // 1. Aggregation for totalIn, totalOut, entries
+    const aggResult = await LedgerEntry.aggregate([
+      {
+        $match: {
+          userId: userObjectId,
+          createdAt: { $gte: start, $lt: end },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalIn: {
+            $sum: {
+              $cond: [{ $eq: ["$direction", "CREDIT"] }, "$amount", 0],
+            },
+          },
+          totalOut: {
+            $sum: {
+              $cond: [{ $eq: ["$direction", "DEBIT"] }, "$amount", 0],
+            },
+          },
+          entries: { $sum: 1 },
+        },
+      },
+    ]);
+
+    const totalIn = aggResult.length > 0 ? aggResult[0].totalIn : 0;
+    const totalOut = aggResult.length > 0 ? aggResult[0].totalOut : 0;
+    const entries = aggResult.length > 0 ? aggResult[0].entries : 0;
+
+    // 2. Opening balance: balanceAfter of user's last ledger entry before monthStart
+    const lastBeforeEntry = await LedgerEntry.findOne({
+      userId: userObjectId,
+      createdAt: { $lt: start },
+    })
+      .sort({ createdAt: -1, _id: -1 })
+      .select("balanceAfter");
+
+    const openingBalance = lastBeforeEntry ? lastBeforeEntry.balanceAfter : 0;
+
+    // 3. Closing balance: balanceAfter of user's last ledger entry inside the month
+    const lastInMonthEntry = await LedgerEntry.findOne({
+      userId: userObjectId,
+      createdAt: { $gte: start, $lt: end },
+    })
+      .sort({ createdAt: -1, _id: -1 })
+      .select("balanceAfter");
+
+    const closingBalance = lastInMonthEntry ? lastInMonthEntry.balanceAfter : openingBalance;
+
+    // 4. Financial reconciliation check: openingBalance + totalIn - totalOut === closingBalance
+    const check = (openingBalance + totalIn - totalOut === closingBalance);
+
+    return res.status(200).json({
+      month,
+      openingBalance,
+      totalIn,
+      totalOut,
+      closingBalance,
+      entries,
+      check,
+    });
+  } catch (error) {
+    console.error("Unexpected error in getStatement:", error);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
+};
+
+/**
  * GET /api/v1/wallet/limits — returns daily spending limit status.
  */
 const getLimits = async (req, res) => {
@@ -615,4 +703,4 @@ const getLimits = async (req, res) => {
   }
 };
 
-export { getBalance, transferFunds, getTransactions, getHistory, getLimits };
+export { getBalance, transferFunds, getTransactions, getHistory, getStatement, getLimits };

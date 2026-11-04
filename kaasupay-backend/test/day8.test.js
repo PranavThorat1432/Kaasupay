@@ -7,6 +7,7 @@ import "dotenv/config";
 import mongoose from "mongoose";
 import LedgerEntry from "../models/ledgerEntryModel.js";
 import Transaction from "../models/transactionModel.js";
+import Wallet from "../models/walletModel.js";
 import { runBackfill } from "../tools/backfill-ledger-type.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -482,11 +483,16 @@ async function main() {
     console.log("\n--- Level 2: Backfill Script Verification ---");
 
     // Insert a dummy Transaction and a LedgerEntry lacking 'type'
+    // Fetch Meena's current wallet to get exact current balance
+    const meenaWalletBeforeDummy = await Wallet.findOne({ userId: meenaSignup.json.user._id });
+    const dummyAmount = 5000;
+    const newBalAfterDummy = (meenaWalletBeforeDummy?.balance || 0) + dummyAmount;
+
     const dummyTxn = await Transaction.create({
       type: "TOPUP",
       fromUserId: null,
       toUserId: meenaSignup.json.user._id,
-      amount: 5000,
+      amount: dummyAmount,
       note: "Old legacy topup",
       status: "COMPLETED",
     });
@@ -495,10 +501,12 @@ async function main() {
       userId: meenaSignup.json.user._id,
       transactionId: dummyTxn._id,
       direction: "CREDIT",
-      amount: 5000,
-      balanceAfter: 100000,
+      amount: dummyAmount,
+      balanceAfter: newBalAfterDummy,
       // No type field provided!
     });
+    // Update wallet balance to match
+    await Wallet.updateOne({ userId: meenaSignup.json.user._id }, { $inc: { balance: dummyAmount } });
     check("Created dummy entry without type", dummyEntry.type === undefined);
 
     // Run backfill pass 1
@@ -615,6 +623,9 @@ async function main() {
     });
     check("Query 2026-10-15 includes transaction made at 23:59 IST", lateFilter.json.items.some((it) => it.id === lateEntry._id.toString()));
 
+    // Clean up lateEntry so it does not corrupt the financial balance chain
+    await LedgerEntry.deleteOne({ _id: lateEntry._id });
+
     // Verify 2026-10-14 excludes this transaction
     const beforeFilter = await get("/api/v1/wallet/history?from=2026-10-14&to=2026-10-14", {
       Authorization: `Bearer ${meenaToken}`,
@@ -670,6 +681,91 @@ async function main() {
     check("Explain plan does not use in-memory SORT stage", winningStage !== "SORT", `winningStage: ${winningStage}`);
     check("Explain plan examined at most 20 documents for limit 20", totalExamined <= 20, `totalExamined: ${totalExamined}`);
 
+    // =========================================================================
+    // LEVEL 4 — Monthly Financial Statements
+    // =========================================================================
+    console.log("\n--- Level 4: Monthly Financial Statements ---");
+
+    // 1. Missing month parameter -> 400
+    const missingMonth = await get("/api/v1/wallet/statement", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("Missing month returns 400", missingMonth.status === 400);
+
+    // 2. Invalid month formats -> 400
+    const badMonth1 = await get("/api/v1/wallet/statement?month=2026-13", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("Month 2026-13 returns 400", badMonth1.status === 400);
+
+    const badMonth2 = await get("/api/v1/wallet/statement?month=Nov-2026", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("Month Nov-2026 returns 400", badMonth2.status === 400);
+
+    const badMonth3 = await get("/api/v1/wallet/statement?month=2026-00", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("Month 2026-00 returns 400", badMonth3.status === 400);
+
+    // 3. Statement for current month (November 2026)
+    // Meena has 46 deposits + 1 transfer debit in November 2026.
+    // Opening balance before Nov was 0.
+    // Total in = 46 * 1000 = 46000 + 5000 (dummy topup) = 51000.
+    // Total out = 2500 (transfer to stranger).
+    // Closing balance = 51000 - 2500 = 48500.
+    const currentMonthStr = "2026-11";
+    const novStatement = await get(`/api/v1/wallet/statement?month=${currentMonthStr}`, {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    console.log("novStatement response:", JSON.stringify(novStatement.json));
+    check(`GET /wallet/statement?month=${currentMonthStr} returns 200`, novStatement.status === 200);
+    check(`Statement has month '${currentMonthStr}'`, novStatement.json?.month === currentMonthStr);
+    check("Statement openingBalance is number", typeof novStatement.json?.openingBalance === "number");
+    check("Statement totalIn > 0", novStatement.json?.totalIn > 0);
+    check("Statement totalOut > 0", novStatement.json?.totalOut > 0);
+    check("Statement entries >= 47", novStatement.json?.entries >= 47);
+    check(
+      "Statement check formula holds: openingBalance + totalIn - totalOut === closingBalance",
+      novStatement.json?.openingBalance + novStatement.json?.totalIn - novStatement.json?.totalOut === novStatement.json?.closingBalance
+    );
+    check("Statement check flag is true", novStatement.json?.check === true);
+
+    // 4. Statement for an empty month in the distant past (e.g. 2025-01)
+    const emptyPastStatement = await get("/api/v1/wallet/statement?month=2025-01", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("Empty past month returns 200", emptyPastStatement.status === 200);
+    check("Empty past month openingBalance is 0", emptyPastStatement.json?.openingBalance === 0);
+    check("Empty past month totalIn is 0", emptyPastStatement.json?.totalIn === 0);
+    check("Empty past month totalOut is 0", emptyPastStatement.json?.totalOut === 0);
+    check("Empty past month closingBalance is 0", emptyPastStatement.json?.closingBalance === 0);
+    check("Empty past month entries is 0", emptyPastStatement.json?.entries === 0);
+    check("Empty past month check is true", emptyPastStatement.json?.check === true);
+
+    // 5. Statement for an empty month in the future (e.g. 2030-01) - opening should equal current closing balance
+    const futureStatement = await get("/api/v1/wallet/statement?month=2030-01", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("Future empty month returns 200", futureStatement.status === 200);
+    check("Future empty month openingBalance > 0", futureStatement.json?.openingBalance > 0);
+    check("Future empty month totalIn is 0", futureStatement.json?.totalIn === 0);
+    check("Future empty month totalOut is 0", futureStatement.json?.totalOut === 0);
+    check(
+      "Future empty month closingBalance equals openingBalance",
+      futureStatement.json?.closingBalance === futureStatement.json?.openingBalance
+    );
+    check("Future empty month entries is 0", futureStatement.json?.entries === 0);
+    check("Future empty month check is true", futureStatement.json?.check === true);
+
+    // 6. User Isolation for Statements
+    const strangerStatement = await get("/api/v1/wallet/statement?month=2026-10", {
+      Authorization: `Bearer ${strangerToken}`,
+    });
+    check("Stranger statement returns 200", strangerStatement.status === 200);
+    check("Stranger statement entries is 0", strangerStatement.json?.entries === 0);
+    check("Stranger statement totalIn is 0", strangerStatement.json?.totalIn === 0);
+    check("Stranger statement check is true", strangerStatement.json?.check === true);
   } finally {
     await mongoose.disconnect();
     server.kill("SIGTERM");
@@ -677,7 +773,7 @@ async function main() {
   }
 
   console.log("\n===============================================================================");
-  console.log(`=== DAY 8 PHASE 1, 2 & 3 ACCEPTANCE SUITE: ${passedAssertions} PASSED, ${failures} FAILED ===`);
+  console.log(`=== DAY 8 PHASE 1-4 ACCEPTANCE SUITE: ${passedAssertions} PASSED, ${failures} FAILED ===`);
   console.log("===============================================================================");
 
   if (failures > 0) {
