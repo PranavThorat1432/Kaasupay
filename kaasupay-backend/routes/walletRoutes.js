@@ -3,6 +3,7 @@ import {
   getBalance,
   transferFunds,
   getTransactions,
+  getHistory,
   getLimits,
 } from "../controllers/walletController.js";
 import {
@@ -33,6 +34,9 @@ router.post("/transfer", requireAuth, moneyRateLimiter, transferFunds);
 
 // GET /api/v1/wallet/transactions — paginated history (Day 3, Level 5).
 router.get("/transactions", requireAuth, getTransactions);
+
+// GET /api/v1/wallet/history — cursor-based transaction history (Day 8, Level 1).
+router.get("/history", requireAuth, getHistory);
 
 // Day 4 Razorpay Add-Money Endpoints
 // POST /api/v1/wallet/add-money/order — create Razorpay order and local PaymentOrder

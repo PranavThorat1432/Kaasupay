@@ -426,6 +426,143 @@ const getTransactions = async (req, res) => {
 };
 
 /**
+ * GET /api/v1/wallet/history — cursor-based transaction history (Day 8 Level 1)
+ *
+ * Query params:
+ *   - limit: optional number (default 20, min 1, max 50)
+ *   - cursor: optional Base64URL encoded cursor { t: string, id: string }
+ *
+ * Sort: { createdAt: -1, _id: -1 }
+ * Fetches: limit + 1 records to determine if there is a next page
+ */
+const getHistory = async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.userId)) {
+      return res.status(401).json({ error: "Unauthorized", message: "Unauthorized" });
+    }
+
+    // 1. Limit validation: default 20, min 1, max 50
+    let limit = 20;
+    if (req.query.limit !== undefined) {
+      const parsedLimit = Number(req.query.limit);
+      if (!Number.isInteger(parsedLimit) || parsedLimit < 1 || parsedLimit > 50) {
+        return res.status(400).json({ error: "Invalid limit", message: "Invalid limit" });
+      }
+      limit = parsedLimit;
+    }
+
+    // 2. Cursor validation and decoding
+    let cursorCondition = null;
+    if (req.query.cursor) {
+      try {
+        const decodedStr = Buffer.from(req.query.cursor, "base64url").toString("utf8");
+        const parsed = JSON.parse(decodedStr);
+        if (!parsed || typeof parsed !== "object" || !parsed.t || !parsed.id) {
+          return res.status(400).json({ error: "Bad cursor", message: "Bad cursor" });
+        }
+        const cursorDate = new Date(parsed.t);
+        if (isNaN(cursorDate.getTime()) || !mongoose.isValidObjectId(parsed.id)) {
+          return res.status(400).json({ error: "Bad cursor", message: "Bad cursor" });
+        }
+        const cursorId = new mongoose.Types.ObjectId(parsed.id);
+        cursorCondition = {
+          $or: [
+            { createdAt: { $lt: cursorDate } },
+            { createdAt: cursorDate, _id: { $lt: cursorId } },
+          ],
+        };
+      } catch (err) {
+        return res.status(400).json({ error: "Bad cursor", message: "Bad cursor" });
+      }
+    }
+
+    // 3. Build query filter
+    const query = {
+      userId: req.userId,
+    };
+    if (cursorCondition) {
+      query.$and = [cursorCondition];
+    }
+
+    // 4. Fetch limit + 1 items with populated transaction details
+    const entries = await LedgerEntry.find(query)
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(limit + 1)
+      .populate({
+        path: "transactionId",
+        select: "type fromUserId toUserId note amount",
+        populate: [
+          { path: "fromUserId", select: "firstName lastName" },
+          { path: "toUserId", select: "firstName lastName" },
+        ],
+      });
+
+    // 5. Evaluate hasMore and generate nextCursor from limit-th record (entries[limit - 1])
+    const hasMore = entries.length > limit;
+    const itemsToReturn = hasMore ? entries.slice(0, limit) : entries;
+
+    let nextCursor = null;
+    if (hasMore) {
+      const last = itemsToReturn[itemsToReturn.length - 1];
+      nextCursor = Buffer.from(
+        JSON.stringify({
+          t: last.createdAt.toISOString(),
+          id: last._id.toString(),
+        })
+      ).toString("base64url");
+    }
+
+    // 6. Map to standardized response fields
+    const items = itemsToReturn.map((entry) => {
+      const txn = entry.transactionId;
+      let withWhom = "Bank deposit";
+      const txnType = entry.type || txn?.type || "UNKNOWN";
+
+      if (txnType === "TOPUP") {
+        withWhom = "Added via Razorpay";
+      } else if (txnType === "WITHDRAWAL") {
+        withWhom = "Withdrawal to bank";
+      } else if (txnType === "REVERSAL") {
+        withWhom = "Refund of failed withdrawal";
+      } else if (txnType === "TRANSFER") {
+        const senderIdStr = txn?.fromUserId?._id?.toString() || txn?.fromUserId?.toString();
+        const meStr = req.userId.toString();
+        if (senderIdStr === meStr) {
+          const r = txn.toUserId;
+          withWhom = r?.firstName ? `${r.firstName} ${r.lastName || ""}`.trim() : "Unknown";
+        } else {
+          const s = txn.fromUserId;
+          withWhom = s?.firstName ? `${s.firstName} ${s.lastName || ""}`.trim() : "Unknown";
+        }
+      }
+
+      return {
+        id: entry._id.toString(),
+        _id: entry._id.toString(),
+        transactionId: txn?._id?.toString() ?? null,
+        type: txnType,
+        label: withWhom,
+        withWhom,
+        direction: entry.direction,
+        amount: entry.amount,
+        balanceAfter: entry.balanceAfter,
+        note: txn?.note ?? null,
+        at: entry.createdAt.toISOString(),
+        createdAt: entry.createdAt,
+      };
+    });
+
+    return res.status(200).json({
+      items,
+      nextCursor,
+    });
+  } catch (error) {
+    console.error("Unexpected error in getHistory:", error);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
+};
+
+/**
  * GET /api/v1/wallet/limits — returns daily spending limit status.
  */
 const getLimits = async (req, res) => {
@@ -441,4 +578,4 @@ const getLimits = async (req, res) => {
   }
 };
 
-export { getBalance, transferFunds, getTransactions, getLimits };
+export { getBalance, transferFunds, getTransactions, getHistory, getLimits };
