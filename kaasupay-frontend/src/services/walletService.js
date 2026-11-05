@@ -253,6 +253,49 @@ export const walletService = {
     );
     return response.data;
   },
+
+  /**
+   * Fetch cursor-paginated transaction history (Day 8 Level 1 & 2)
+   * @param {{ limit?: number, cursor?: string, direction?: string, type?: string, from?: string, to?: string }} params
+   * @returns {Promise<{ items: Array<any>, nextCursor: string|null }>}
+   */
+  async getHistory(params = {}) {
+    const response = await apiClient.get('/api/v1/wallet/history', { params });
+    return response.data;
+  },
+
+  /**
+   * Fetch monthly financial statement (Day 8 Level 4)
+   * @param {string} month - Format YYYY-MM (e.g. "2026-11")
+   * @returns {Promise<{ month: string, openingBalance: number, totalIn: number, totalOut: number, closingBalance: number, entries: number, check: boolean }>}
+   */
+  async getMonthlyStatement(month) {
+    const response = await apiClient.get('/api/v1/wallet/statement', {
+      params: { month },
+    });
+    return response.data;
+  },
+
+  /**
+   * Download monthly financial statement CSV (Day 8 Level 5)
+   * Automatically handles Blob creation and initiates browser file download
+   * @param {string} month - Format YYYY-MM
+   */
+  async downloadMonthlyStatementCsv(month) {
+    const response = await apiClient.get('/api/v1/wallet/statement/csv', {
+      params: { month },
+      responseType: 'blob',
+    });
+
+    const url = window.URL.createObjectURL(new Blob([response.data], { type: 'text/csv;charset=utf-8;' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', `kaasupay-${month}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.URL.revokeObjectURL(url);
+  },
 };
 
 export default walletService;
