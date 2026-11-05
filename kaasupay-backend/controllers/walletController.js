@@ -14,7 +14,8 @@ import IdempotencyRecord from "../models/idempotencyRecordModel.js";
 import { transfer as transferMoney, MoneyError, hashRequest } from "../services/money.js";
 import { verifyPin } from "../services/pinService.js";
 import { getDailyLimitStatus } from "../services/dailyLimitService.js";
-import { parseIstDateRange, parseIstMonthRange, isValidMonthStr } from "../services/dateUtils.js";
+import { parseIstDateRange, parseIstMonthRange, isValidMonthStr, formatIstDateTime } from "../services/dateUtils.js";
+import { rupees, buildCsv } from "../services/csv.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -688,6 +689,68 @@ const getStatement = async (req, res) => {
 };
 
 /**
+ * GET /api/v1/wallet/statement/csv?month=YYYY-MM — downloads monthly financial statement as CSV.
+ * Sorted oldest first (createdAt: 1, _id: 1) for chronological audit readability.
+ * Formats: Date (IST), Type, Description, Debit (Rs), Credit (Rs), Balance (Rs).
+ */
+const downloadStatementCsv = async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.userId)) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const { month } = req.query;
+    if (!month || !isValidMonthStr(month)) {
+      return res.status(400).json({
+        error: "Invalid or missing month parameter. Expected format: YYYY-MM (e.g. 2026-11)",
+      });
+    }
+
+    const { start, end } = parseIstMonthRange(month);
+    const userObjectId = new mongoose.Types.ObjectId(req.userId);
+
+    // Fetch entries sorted chronologically (oldest first) with populated transaction note
+    const entries = await LedgerEntry.find({
+      userId: userObjectId,
+      createdAt: { $gte: start, $lt: end },
+    })
+      .populate("transactionId", "note type fromUserId toUserId")
+      .sort({ createdAt: 1, _id: 1 })
+      .lean();
+
+    const headers = [
+      "Date",
+      "Type",
+      "Description",
+      "Debit (Rs)",
+      "Credit (Rs)",
+      "Balance (Rs)",
+    ];
+
+    const rows = entries.map((e) => {
+      const txn = e.transactionId;
+      const dateStr = formatIstDateTime(e.createdAt);
+      const typeStr = e.type || txn?.type || (e.direction === "DEBIT" ? "WITHDRAWAL" : "DEPOSIT");
+      const descStr = txn?.note || e.note || "";
+      const debitStr = e.direction === "DEBIT" ? rupees(e.amount) : "";
+      const creditStr = e.direction === "CREDIT" ? rupees(e.amount) : "";
+      const balanceStr = rupees(e.balanceAfter);
+
+      return [dateStr, typeStr, descStr, debitStr, creditStr, balanceStr];
+    });
+
+    const csvContent = buildCsv(headers, rows);
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="kaasupay-${month}.csv"`);
+    return res.status(200).send(csvContent);
+  } catch (error) {
+    console.error("Unexpected error in downloadStatementCsv:", error);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
+};
+
+/**
  * GET /api/v1/wallet/limits — returns daily spending limit status.
  */
 const getLimits = async (req, res) => {
@@ -703,4 +766,4 @@ const getLimits = async (req, res) => {
   }
 };
 
-export { getBalance, transferFunds, getTransactions, getHistory, getStatement, getLimits };
+export { getBalance, transferFunds, getTransactions, getHistory, getStatement, downloadStatementCsv, getLimits };

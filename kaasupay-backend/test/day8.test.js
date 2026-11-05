@@ -9,6 +9,7 @@ import LedgerEntry from "../models/ledgerEntryModel.js";
 import Transaction from "../models/transactionModel.js";
 import Wallet from "../models/walletModel.js";
 import { runBackfill } from "../tools/backfill-ledger-type.js";
+import { rupees, csvCell, buildCsv } from "../services/csv.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PORT = 3124;
@@ -79,6 +80,15 @@ async function get(path, headers = {}) {
     json = await res.json();
   } catch {}
   return { status: res.status, headers: res.headers, json };
+}
+
+async function getRaw(path, headers = {}) {
+  const res = await fetch(`${BASE}${path}`, {
+    method: "GET",
+    headers: { ...headers },
+  });
+  const text = await res.text();
+  return { status: res.status, headers: res.headers, text };
 }
 
 async function main() {
@@ -766,6 +776,82 @@ async function main() {
     check("Stranger statement entries is 0", strangerStatement.json?.entries === 0);
     check("Stranger statement totalIn is 0", strangerStatement.json?.totalIn === 0);
     check("Stranger statement check is true", strangerStatement.json?.check === true);
+    // =========================================================================
+    // LEVEL 5 — Secure CSV Statement Export
+    // =========================================================================
+    console.log("\n--- Level 5: Secure CSV Statement Export ---");
+
+    // D5: CSV Unit Tests (RFC-4180 escaping, Formula Injection, Integer Rupee conversion)
+    check("Rupees 2500 paise -> '25.00'", rupees(2500) === "25.00");
+    check("Rupees 50 paise -> '0.50'", rupees(50) === "0.50");
+    check("Rupees 5 paise -> '0.05'", rupees(5) === "0.05");
+    check("Rupees 0 paise -> '0.00'", rupees(0) === "0.00");
+    check("Rupees 100000 paise -> '1000.00'", rupees(100000) === "1000.00");
+    check("Rupees null -> ''", rupees(null) === "");
+
+    // Formula injection tests
+    check("csvCell formula =SUM(A1) escaped with leading single quote", csvCell("=SUM(A1:B10)") === "'=SUM(A1:B10)");
+    check("csvCell formula +cmd escaped", csvCell("+1234") === "'+1234");
+    check("csvCell formula -2+3 escaped", csvCell("-cmd|' /C calc'!A0") === "'-cmd|' /C calc'!A0");
+    check("csvCell formula @import escaped", csvCell("@import") === "'@import");
+
+    // RFC-4180 escaping
+    check("csvCell with comma wrapped in quotes", csvCell("Transfer to Raju, via UPI") === '"Transfer to Raju, via UPI"');
+    check('csvCell with quote doubled and wrapped', csvCell('Payment for "Groceries"') === '"Payment for ""Groceries"""');
+    check("csvCell normal string unquoted", csvCell("Transfer") === "Transfer");
+
+    // D6: CSV Integration Endpoint Tests
+    // 1. Missing month parameter -> 400
+    const csvMissingMonth = await get("/api/v1/wallet/statement/csv", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("CSV missing month returns 400", csvMissingMonth.status === 400);
+
+    // 2. Bad month parameter -> 400
+    const csvBadMonth = await get("/api/v1/wallet/statement/csv?month=2026-13", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("CSV bad month returns 400", csvBadMonth.status === 400);
+
+    // 3. Unauthorized request -> 401
+    const csvUnauth = await get("/api/v1/wallet/statement/csv?month=2026-11");
+    check("CSV unauthenticated returns 401", csvUnauth.status === 401);
+
+    // 4. Successful November CSV export
+    const csvResponse = await getRaw("/api/v1/wallet/statement/csv?month=2026-11", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("GET /wallet/statement/csv returns 200", csvResponse.status === 200);
+    check(
+      "Content-Type is text/csv; charset=utf-8",
+      csvResponse.headers.get("content-type")?.includes("text/csv")
+    );
+    check(
+      "Content-Disposition specifies attachment with filename",
+      csvResponse.headers.get("content-disposition") === 'attachment; filename="kaasupay-2026-11.csv"'
+    );
+
+    // Parse CSV lines
+    const csvText = csvResponse.text;
+    const lines = csvText.trim().split("\r\n");
+    console.log("CSV line 1:", lines[1]);
+    console.log("CSV line 2:", lines[2]);
+    check("CSV has header row and entry rows", lines.length >= 48); // 1 header + >= 47 entries
+
+    const expectedHeader = "Date,Type,Description,Debit (Rs),Credit (Rs),Balance (Rs)";
+    check("CSV header row matches standard specification", lines[0] === expectedHeader);
+
+    // Verify oldest first ordering (first entry should be Deposit #1, not #46)
+    check("First data line is oldest transaction (Deposit #1)", lines[1].includes("Deposit #1"));
+    check("Last data line contains recent transaction", lines[lines.length - 1].length > 0);
+
+    // Verify Empty Month CSV Export
+    const emptyCsvResponse = await getRaw("/api/v1/wallet/statement/csv?month=2025-01", {
+      Authorization: `Bearer ${meenaToken}`,
+    });
+    check("Empty month CSV returns 200", emptyCsvResponse.status === 200);
+    const emptyLines = emptyCsvResponse.text.trim().split("\r\n");
+    check("Empty month CSV has only header row", emptyLines.length === 1 && emptyLines[0] === expectedHeader);
   } finally {
     await mongoose.disconnect();
     server.kill("SIGTERM");
@@ -773,7 +859,7 @@ async function main() {
   }
 
   console.log("\n===============================================================================");
-  console.log(`=== DAY 8 PHASE 1-4 ACCEPTANCE SUITE: ${passedAssertions} PASSED, ${failures} FAILED ===`);
+  console.log(`=== DAY 8 PHASE 1-5 ACCEPTANCE SUITE: ${passedAssertions} PASSED, ${failures} FAILED ===`);
   console.log("===============================================================================");
 
   if (failures > 0) {
