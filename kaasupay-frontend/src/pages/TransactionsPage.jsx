@@ -753,13 +753,10 @@ export function TransactionsPage() {
                 size="md"
                 onClick={handleDownloadCsv}
                 disabled={isDownloadingCsv || isLoadingStatement}
-                className="flex items-center gap-2 self-start sm:self-auto font-semibold text-xs"
+                isLoading={isDownloadingCsv}
+                leftIcon={<Download className="w-4 h-4 shrink-0" />}
+                className="self-start sm:self-auto font-semibold text-xs whitespace-nowrap"
               >
-                {isDownloadingCsv ? (
-                  <RefreshCw className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Download className="w-4 h-4" />
-                )}
                 {isDownloadingCsv ? 'Generating CSV...' : 'Download Statement (CSV)'}
               </Button>
             </CardContent>
