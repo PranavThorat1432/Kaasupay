@@ -14,6 +14,8 @@ import IdempotencyRecord from "../models/idempotencyRecordModel.js";
 import { transfer as transferMoney, MoneyError, hashRequest } from "../services/money.js";
 import { verifyPin } from "../services/pinService.js";
 import { getDailyLimitStatus } from "../services/dailyLimitService.js";
+import { parseIstDateRange, parseIstMonthRange, isValidMonthStr, formatIstDateTime } from "../services/dateUtils.js";
+import { rupees, buildCsv } from "../services/csv.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -426,6 +428,329 @@ const getTransactions = async (req, res) => {
 };
 
 /**
+ * GET /api/v1/wallet/history — cursor-based transaction history (Day 8 Level 1)
+ *
+ * Query params:
+ *   - limit: optional number (default 20, min 1, max 50)
+ *   - cursor: optional Base64URL encoded cursor { t: string, id: string }
+ *
+ * Sort: { createdAt: -1, _id: -1 }
+ * Fetches: limit + 1 records to determine if there is a next page
+ */
+const getHistory = async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.userId)) {
+      return res.status(401).json({ error: "Unauthorized", message: "Unauthorized" });
+    }
+
+    // 1. Limit validation: default 20, min 1, max 50
+    let limit = 20;
+    if (req.query.limit !== undefined) {
+      const parsedLimit = Number(req.query.limit);
+      if (!Number.isInteger(parsedLimit) || parsedLimit < 1 || parsedLimit > 50) {
+        return res.status(400).json({ error: "Invalid limit", message: "Invalid limit" });
+      }
+      limit = parsedLimit;
+    }
+
+    // 2. Cursor validation and decoding
+    let cursorCondition = null;
+    if (req.query.cursor) {
+      try {
+        const decodedStr = Buffer.from(req.query.cursor, "base64url").toString("utf8");
+        const parsed = JSON.parse(decodedStr);
+        if (!parsed || typeof parsed !== "object" || !parsed.t || !parsed.id) {
+          return res.status(400).json({ error: "Bad cursor", message: "Bad cursor" });
+        }
+        const cursorDate = new Date(parsed.t);
+        if (isNaN(cursorDate.getTime()) || !mongoose.isValidObjectId(parsed.id)) {
+          return res.status(400).json({ error: "Bad cursor", message: "Bad cursor" });
+        }
+        const cursorId = new mongoose.Types.ObjectId(parsed.id);
+        cursorCondition = {
+          $or: [
+            { createdAt: { $lt: cursorDate } },
+            { createdAt: cursorDate, _id: { $lt: cursorId } },
+          ],
+        };
+      } catch (err) {
+        return res.status(400).json({ error: "Bad cursor", message: "Bad cursor" });
+      }
+    }
+
+    // 3. Direction and Type filter validation (Day 8 Level 2)
+    const VALID_DIRECTIONS = ["DEBIT", "CREDIT"];
+    const VALID_TYPES = ["TRANSFER", "DEPOSIT", "TOPUP", "WITHDRAWAL", "REVERSAL"];
+
+    if (req.query.direction !== undefined) {
+      if (!VALID_DIRECTIONS.includes(req.query.direction)) {
+        return res.status(400).json({ error: "Invalid direction filter", message: "Invalid direction filter" });
+      }
+    }
+
+    if (req.query.type !== undefined) {
+      if (!VALID_TYPES.includes(req.query.type)) {
+        return res.status(400).json({ error: "Invalid type filter", message: "Invalid type filter" });
+      }
+    }
+
+    // 4. India Standard Time Date Range validation (Day 8 Level 2)
+    const { dateCondition, error: dateError } = parseIstDateRange(req.query.from, req.query.to);
+    if (dateError) {
+      return res.status(400).json({ error: dateError, message: dateError });
+    }
+
+    // 5. Build combined query filter using $and
+    const andClauses = [];
+    if (cursorCondition) {
+      andClauses.push(cursorCondition);
+    }
+    if (req.query.direction) {
+      andClauses.push({ direction: req.query.direction });
+    }
+    if (req.query.type) {
+      andClauses.push({ type: req.query.type });
+    }
+    if (dateCondition) {
+      andClauses.push(dateCondition);
+    }
+
+    const query = {
+      userId: req.userId,
+    };
+    if (andClauses.length > 0) {
+      query.$and = andClauses;
+    }
+
+    // 6. Fetch limit + 1 items with populated transaction details
+    const entries = await LedgerEntry.find(query)
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(limit + 1)
+      .populate({
+        path: "transactionId",
+        select: "type fromUserId toUserId note amount",
+        populate: [
+          { path: "fromUserId", select: "firstName lastName" },
+          { path: "toUserId", select: "firstName lastName" },
+        ],
+      });
+
+    // 5. Evaluate hasMore and generate nextCursor from limit-th record (entries[limit - 1])
+    const hasMore = entries.length > limit;
+    const itemsToReturn = hasMore ? entries.slice(0, limit) : entries;
+
+    let nextCursor = null;
+    if (hasMore) {
+      const last = itemsToReturn[itemsToReturn.length - 1];
+      nextCursor = Buffer.from(
+        JSON.stringify({
+          t: last.createdAt.toISOString(),
+          id: last._id.toString(),
+        })
+      ).toString("base64url");
+    }
+
+    // 6. Map to standardized response fields
+    const items = itemsToReturn.map((entry) => {
+      const txn = entry.transactionId;
+      let withWhom = "Bank deposit";
+      const txnType = entry.type || txn?.type || "UNKNOWN";
+
+      if (txnType === "TOPUP") {
+        withWhom = "Added via Razorpay";
+      } else if (txnType === "WITHDRAWAL") {
+        withWhom = "Withdrawal to bank";
+      } else if (txnType === "REVERSAL") {
+        withWhom = "Refund of failed withdrawal";
+      } else if (txnType === "TRANSFER") {
+        const senderIdStr = txn?.fromUserId?._id?.toString() || txn?.fromUserId?.toString();
+        const meStr = req.userId.toString();
+        if (senderIdStr === meStr) {
+          const r = txn.toUserId;
+          withWhom = r?.firstName ? `${r.firstName} ${r.lastName || ""}`.trim() : "Unknown";
+        } else {
+          const s = txn.fromUserId;
+          withWhom = s?.firstName ? `${s.firstName} ${s.lastName || ""}`.trim() : "Unknown";
+        }
+      }
+
+      return {
+        id: entry._id.toString(),
+        _id: entry._id.toString(),
+        transactionId: txn?._id?.toString() ?? null,
+        type: txnType,
+        label: withWhom,
+        withWhom,
+        direction: entry.direction,
+        amount: entry.amount,
+        balanceAfter: entry.balanceAfter,
+        note: txn?.note ?? null,
+        at: entry.createdAt.toISOString(),
+        createdAt: entry.createdAt,
+      };
+    });
+
+    return res.status(200).json({
+      items,
+      nextCursor,
+    });
+  } catch (error) {
+    console.error("Unexpected error in getHistory:", error);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
+};
+
+/**
+ * GET /api/v1/wallet/statement?month=YYYY-MM — Monthly financial statement (Day 8 Level 4)
+ */
+const getStatement = async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.userId)) {
+      return res.status(401).json({ error: "Unauthorized", message: "Unauthorized" });
+    }
+
+    const { month } = req.query;
+    if (!month || !isValidMonthStr(month)) {
+      return res.status(400).json({
+        error: "Invalid month format. Expected YYYY-MM (e.g. 2026-11)",
+        message: "Invalid month format. Expected YYYY-MM (e.g. 2026-11)",
+      });
+    }
+
+    const { start, end } = parseIstMonthRange(month);
+    const userObjectId = new mongoose.Types.ObjectId(req.userId);
+
+    // 1. Aggregation for totalIn, totalOut, entries
+    const aggResult = await LedgerEntry.aggregate([
+      {
+        $match: {
+          userId: userObjectId,
+          createdAt: { $gte: start, $lt: end },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalIn: {
+            $sum: {
+              $cond: [{ $eq: ["$direction", "CREDIT"] }, "$amount", 0],
+            },
+          },
+          totalOut: {
+            $sum: {
+              $cond: [{ $eq: ["$direction", "DEBIT"] }, "$amount", 0],
+            },
+          },
+          entries: { $sum: 1 },
+        },
+      },
+    ]);
+
+    const totalIn = aggResult.length > 0 ? aggResult[0].totalIn : 0;
+    const totalOut = aggResult.length > 0 ? aggResult[0].totalOut : 0;
+    const entries = aggResult.length > 0 ? aggResult[0].entries : 0;
+
+    // 2. Opening balance: balanceAfter of user's last ledger entry before monthStart
+    const lastBeforeEntry = await LedgerEntry.findOne({
+      userId: userObjectId,
+      createdAt: { $lt: start },
+    })
+      .sort({ createdAt: -1, _id: -1 })
+      .select("balanceAfter");
+
+    const openingBalance = lastBeforeEntry ? lastBeforeEntry.balanceAfter : 0;
+
+    // 3. Closing balance: balanceAfter of user's last ledger entry inside the month
+    const lastInMonthEntry = await LedgerEntry.findOne({
+      userId: userObjectId,
+      createdAt: { $gte: start, $lt: end },
+    })
+      .sort({ createdAt: -1, _id: -1 })
+      .select("balanceAfter");
+
+    const closingBalance = lastInMonthEntry ? lastInMonthEntry.balanceAfter : openingBalance;
+
+    // 4. Financial reconciliation check: openingBalance + totalIn - totalOut === closingBalance
+    const check = (openingBalance + totalIn - totalOut === closingBalance);
+
+    return res.status(200).json({
+      month,
+      openingBalance,
+      totalIn,
+      totalOut,
+      closingBalance,
+      entries,
+      check,
+    });
+  } catch (error) {
+    console.error("Unexpected error in getStatement:", error);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
+};
+
+/**
+ * GET /api/v1/wallet/statement/csv?month=YYYY-MM — downloads monthly financial statement as CSV.
+ * Sorted oldest first (createdAt: 1, _id: 1) for chronological audit readability.
+ * Formats: Date (IST), Type, Description, Debit (Rs), Credit (Rs), Balance (Rs).
+ */
+const downloadStatementCsv = async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.userId)) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const { month } = req.query;
+    if (!month || !isValidMonthStr(month)) {
+      return res.status(400).json({
+        error: "Invalid or missing month parameter. Expected format: YYYY-MM (e.g. 2026-11)",
+      });
+    }
+
+    const { start, end } = parseIstMonthRange(month);
+    const userObjectId = new mongoose.Types.ObjectId(req.userId);
+
+    // Fetch entries sorted chronologically (oldest first) with populated transaction note
+    const entries = await LedgerEntry.find({
+      userId: userObjectId,
+      createdAt: { $gte: start, $lt: end },
+    })
+      .populate("transactionId", "note type fromUserId toUserId")
+      .sort({ createdAt: 1, _id: 1 })
+      .lean();
+
+    const headers = [
+      "Date",
+      "Type",
+      "Description",
+      "Debit (Rs)",
+      "Credit (Rs)",
+      "Balance (Rs)",
+    ];
+
+    const rows = entries.map((e) => {
+      const txn = e.transactionId;
+      const dateStr = formatIstDateTime(e.createdAt);
+      const typeStr = e.type || txn?.type || (e.direction === "DEBIT" ? "WITHDRAWAL" : "DEPOSIT");
+      const descStr = txn?.note || e.note || "";
+      const debitStr = e.direction === "DEBIT" ? rupees(e.amount) : "";
+      const creditStr = e.direction === "CREDIT" ? rupees(e.amount) : "";
+      const balanceStr = rupees(e.balanceAfter);
+
+      return [dateStr, typeStr, descStr, debitStr, creditStr, balanceStr];
+    });
+
+    const csvContent = buildCsv(headers, rows);
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="kaasupay-${month}.csv"`);
+    return res.status(200).send(csvContent);
+  } catch (error) {
+    console.error("Unexpected error in downloadStatementCsv:", error);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
+};
+
+/**
  * GET /api/v1/wallet/limits — returns daily spending limit status.
  */
 const getLimits = async (req, res) => {
@@ -441,4 +766,4 @@ const getLimits = async (req, res) => {
   }
 };
 
-export { getBalance, transferFunds, getTransactions, getLimits };
+export { getBalance, transferFunds, getTransactions, getHistory, getStatement, downloadStatementCsv, getLimits };
