@@ -378,7 +378,7 @@ export function TransactionsPage() {
       {/* Overview Cards (Current Month) */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         {/* Money In */}
-        <Card className="border-slate-200 shadow-sm bg-gradient-to-br from-white to-emerald-50/20">
+        <Card className="border-slate-200 shadow-sm bg-linear-to-br from-white to-emerald-50/20">
           <CardContent className="p-4 sm:p-5 flex items-center justify-between">
             <div className="space-y-1">
               <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider">
@@ -399,7 +399,7 @@ export function TransactionsPage() {
         </Card>
 
         {/* Money Out */}
-        <Card className="border-slate-200 shadow-sm bg-gradient-to-br from-white to-rose-50/20">
+        <Card className="border-slate-200 shadow-sm bg-linear-to-br from-white to-rose-50/20">
           <CardContent className="p-4 sm:p-5 flex items-center justify-between">
             <div className="space-y-1">
               <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider">
@@ -420,7 +420,7 @@ export function TransactionsPage() {
         </Card>
 
         {/* Activity Volume */}
-        <Card className="border-slate-200 shadow-sm bg-gradient-to-br from-white to-cobalt-50/20">
+        <Card className="border-slate-200 shadow-sm bg-linear-to-br from-white to-cobalt-50/20">
           <CardContent className="p-4 sm:p-5 flex items-center justify-between">
             <div className="space-y-1">
               <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider">
@@ -789,7 +789,7 @@ export function TransactionsPage() {
             </Card>
 
             {/* Money In */}
-            <Card className="border-slate-200 shadow-sm bg-emerald-50/20 border-emerald-100">
+            <Card className="border-slate-200 shadow-sm bg-emerald-50/20">
               <CardContent className="p-4 space-y-1">
                 <span className="text-[11px] font-bold text-emerald-700 uppercase tracking-wider flex items-center gap-1">
                   <ArrowDownLeft className="w-3.5 h-3.5" />
@@ -807,7 +807,7 @@ export function TransactionsPage() {
             </Card>
 
             {/* Money Out */}
-            <Card className="border-slate-200 shadow-sm bg-rose-50/20 border-rose-100">
+            <Card className="border-slate-200 shadow-sm bg-rose-50/20">
               <CardContent className="p-4 space-y-1">
                 <span className="text-[11px] font-bold text-rose-700 uppercase tracking-wider flex items-center gap-1">
                   <ArrowUpRight className="w-3.5 h-3.5" />
@@ -825,7 +825,7 @@ export function TransactionsPage() {
             </Card>
 
             {/* Closing Balance */}
-            <Card className="border-slate-200 shadow-sm bg-cobalt-50/30 border-cobalt-100">
+            <Card className="border-slate-200 shadow-sm bg-cobalt-50/30">
               <CardContent className="p-4 space-y-1">
                 <span className="text-[11px] font-bold text-cobalt-800 uppercase tracking-wider">
                   4. Closing Balance
@@ -863,11 +863,13 @@ export function TransactionsPage() {
                             : 'Reconciliation Discrepancy Detected'}
                         </h4>
                         <Badge variant={statementData.check ? 'credit' : 'debit'} size="sm">
-                          {statementData.check ? 'Check: Passed' : 'Check: Failed'}
+                          {statementData.check ? 'Verified' : 'Review Needed'}
                         </Badge>
                       </div>
-                      <p className="text-xs text-slate-600 mt-1 font-mono">
-                        Formula: Opening (₹{(statementData.openingBalance / 100).toFixed(2)}) + In (₹{(statementData.totalIn / 100).toFixed(2)}) - Out (₹{(statementData.totalOut / 100).toFixed(2)}) = Closing (₹{(statementData.closingBalance / 100).toFixed(2)})
+                      <p className="text-xs text-slate-600 mt-1">
+                        {statementData.check
+                          ? 'All ledger entries for this month are mathematically balanced and accounted for.'
+                          : 'A discrepancy was detected in this month’s balance calculations. Please contact support.'}
                       </p>
                     </div>
                   </div>
@@ -1053,7 +1055,7 @@ export function TransactionsPage() {
               <div className="p-3 bg-slate-50 rounded-xl flex items-center justify-between">
                 <span className="text-slate-500">Transaction ID</span>
                 <div className="flex items-center gap-1.5 font-mono text-[11px] text-slate-700">
-                  <span className="truncate max-w-[190px]">
+                  <span className="truncate max-w-47.5">
                     {selectedTx.transactionId || selectedTx.id || selectedTx._id}
                   </span>
                   <button
