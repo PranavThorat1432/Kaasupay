@@ -46,6 +46,11 @@ const userSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+    role: {
+      type: String,
+      enum: ["USER", "SYSTEM_REWARD", "ADMIN"],
+      default: "USER",
+    },
   },
   { timestamps: true } // adds createdAt / updatedAt
 );

@@ -9,6 +9,7 @@ import LedgerEntry from "../models/ledgerEntryModel.js";
 import IdempotencyRecord from "../models/idempotencyRecordModel.js";
 import { verifyPin } from "../services/pinService.js";
 import { checkAndConsumeDailyLimit } from "../services/dailyLimitService.js";
+import { issueRewardCardIfEligible } from "../services/promoService.js";
 import { MoneyError } from "../services/money.js";
 import { REQUEST_EXPIRY_DAYS } from "../config.js";
 import { createRequestSchema } from "../validations/requestValidation.js";
@@ -657,6 +658,15 @@ export async function payRequest(req, res) {
           { $set: { transactionId: txn._id } },
           { session }
         );
+
+        // Day 9: Issue promotional reward scratch card if eligible
+        await issueRewardCardIfEligible({
+          payerId: req.userId,
+          recipientId: doc.requesterId,
+          paymentAmount: doc.amount,
+          transactionId: txn._id,
+          session,
+        });
 
         settlementResult = {
           transactionId: txn._id.toString(),

@@ -22,6 +22,7 @@ import PaymentOrder from "../models/paymentOrderModel.js";
 import Withdrawal from "../models/withdrawalModel.js";
 import OutboxEvent from "../models/outboxEventModel.js";
 import { checkAndConsumeDailyLimit } from "./dailyLimitService.js";
+import { issueRewardCardIfEligible } from "./promoService.js";
 
 // ---------------------------------------------------------------------------
 // Custom business error
@@ -245,12 +246,22 @@ export async function transfer({ fromUserId, toUserId, amount, note }) {
         { session }
       );
 
+      // Day 9: Issue promotional reward scratch card if eligible
+      const rewardCard = await issueRewardCardIfEligible({
+        payerId: fromUserId,
+        recipientId: toUserId,
+        paymentAmount: amount,
+        transactionId: txn._id,
+        session,
+      });
+
       result = {
         transaction: txn,
         debitEntry,
         creditEntry,
         senderBalance,
         receiverBalance,
+        rewardCard,
       };
     });
   } finally {

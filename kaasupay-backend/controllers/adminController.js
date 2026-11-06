@@ -13,8 +13,11 @@ import Transaction from "../models/transactionModel.js";
 import LedgerEntry from "../models/ledgerEntryModel.js";
 import Withdrawal from "../models/withdrawalModel.js";
 import OutboxEvent from "../models/outboxEventModel.js";
+import Offer from "../models/Offer.js";
+import RewardCard from "../models/RewardCard.js";
 import { deposit as depositMoney, reverseWithdrawal, MoneyError } from "../services/money.js";
 import { unlockUserPin } from "../services/pinService.js";
+import { createOfferWithDeposit, PromoError } from "../services/promoService.js";
 import { ADMIN_KEY, BANK_URL } from "../config.js";
 
 // ---------------------------------------------------------------------------
@@ -466,6 +469,187 @@ const getAdminWithdrawalBankStatus = async (req, res) => {
   }
 };
 
+// ---------------------------------------------------------------------------
+// Day 9: Promotional Offer Management & Audit Reports (Staff Only)
+// ---------------------------------------------------------------------------
+
+const createOfferSchema = z.object({
+  code: z
+    .string({ error: "code is required" })
+    .trim()
+    .toUpperCase()
+    .regex(/^[A-Z0-9]{3,20}$/, { error: "code must be 3-20 capital letters or digits" }),
+  percent: z
+    .number({ error: "percent must be a number" })
+    .int({ error: "percent must be an integer" })
+    .min(1, { error: "percent must be between 1 and 50" })
+    .max(50, { error: "percent must be between 1 and 50" }),
+  maxCashback: z
+    .number({ error: "maxCashback must be a number" })
+    .int({ error: "maxCashback must be an integer (paise)" })
+    .min(1, { error: "maxCashback must be at least 1 paise" }),
+  minPayment: z
+    .number({ error: "minPayment must be a number" })
+    .int({ error: "minPayment must be an integer (paise)" })
+    .min(1, { error: "minPayment must be at least 1 paise" }),
+  budget: z
+    .number({ error: "budget must be a number" })
+    .int({ error: "budget must be an integer (paise)" })
+    .min(1, { error: "budget must be at least 1 paise" }),
+  days: z
+    .number({ error: "days must be a number" })
+    .int({ error: "days must be an integer" })
+    .min(1, { error: "days must be between 1 and 30" })
+    .max(30, { error: "days must be between 1 and 30" }),
+});
+
+/**
+ * POST /api/v1/admin/offers
+ * Creates an offer and deposits its budget into the Promo System Wallet.
+ */
+const adminCreateOffer = async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+
+  const parsed = createOfferSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ message: "Invalid inputs", error: "Invalid inputs" });
+  }
+
+  try {
+    const offer = await createOfferWithDeposit(parsed.data);
+    return res.status(201).json({
+      message: "Offer created",
+      offer: {
+        code: offer.code,
+        percent: offer.percent,
+        maxCashback: offer.maxCashback,
+        minPayment: offer.minPayment,
+        budget: offer.budget,
+        budgetLeft: offer.budgetLeft,
+        startsAt: offer.startsAt.toISOString(),
+        endsAt: offer.endsAt.toISOString(),
+      },
+    });
+  } catch (err) {
+    if (err instanceof PromoError) {
+      return res.status(err.status).json({ message: err.message, error: err.message });
+    }
+    console.error("Unexpected error in adminCreateOffer:", err);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
+};
+
+/**
+ * GET /api/v1/admin/offers/:code
+ * Aggregated campaign audit report verifying budget conservation.
+ */
+const getOfferReport = async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+
+  try {
+    const code = req.params.code?.trim()?.toUpperCase();
+    const offer = await Offer.findOne({ code });
+    if (!offer) {
+      return res.status(404).json({ message: "Offer not found", error: "Offer not found" });
+    }
+
+    const stats = await RewardCard.aggregate([
+      { $match: { offerId: offer._id } },
+      {
+        $group: {
+          _id: "$status",
+          count: { $sum: 1 },
+          totalAmount: {
+            $sum: { $cond: [{ $eq: ["$status", "CLAIMED"] }, "$amount", 0] },
+          },
+        },
+      },
+    ]);
+
+    let unclaimed = 0;
+    let claimed = 0;
+    let exhausted = 0;
+    let expired = 0;
+    let cardsIssued = 0;
+    let totalPaid = 0;
+
+    for (const s of stats) {
+      cardsIssued += s.count;
+      if (s._id === "UNCLAIMED") unclaimed = s.count;
+      else if (s._id === "CLAIMED") {
+        claimed = s.count;
+        totalPaid = s.totalAmount;
+      } else if (s._id === "EXHAUSTED") exhausted = s.count;
+      else if (s._id === "EXPIRED") expired = s.count;
+    }
+
+    const check = offer.budget - offer.budgetLeft === totalPaid;
+
+    return res.status(200).json({
+      code: offer.code,
+      budget: offer.budget,
+      budgetLeft: offer.budgetLeft,
+      cardsIssued,
+      unclaimed,
+      claimed,
+      exhausted,
+      expired,
+      totalPaid,
+      check,
+    });
+  } catch (err) {
+    console.error("Unexpected error in getOfferReport:", err);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
+};
+
+/**
+ * POST /api/v1/admin/offers/:code/stop (Bonus 8)
+ * Deactivates an offer early.
+ */
+const stopOffer = async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+
+  try {
+    const code = req.params.code?.trim()?.toUpperCase();
+    const offer = await Offer.findOneAndUpdate(
+      { code, isActive: true },
+      { $set: { isActive: false, endsAt: new Date() } },
+      { new: true }
+    );
+
+    if (!offer) {
+      return res.status(404).json({ message: "Active offer not found", error: "Active offer not found" });
+    }
+
+    return res.status(200).json({
+      message: "Offer stopped",
+      code: offer.code,
+      budgetLeft: offer.budgetLeft,
+      isActive: offer.isActive,
+    });
+  } catch (err) {
+    console.error("Unexpected error in stopOffer:", err);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
+};
+
+/**
+ * GET /api/v1/admin/offers
+ * Lists all offers for admin overview.
+ */
+const listAdminOffers = async (req, res) => {
+  if (!checkAdminKey(req, res)) return;
+
+  try {
+    const offers = await Offer.find({}).sort({ createdAt: -1 });
+    return res.status(200).json({ offers });
+  } catch (err) {
+    console.error("Unexpected error in listAdminOffers:", err);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
+};
+
 export {
   adminDeposit,
   adminReconcile,
@@ -473,4 +657,8 @@ export {
   adminUnlockPin,
   resolveAdminWithdrawal,
   getAdminWithdrawalBankStatus,
+  adminCreateOffer,
+  getOfferReport,
+  stopOffer,
+  listAdminOffers,
 };

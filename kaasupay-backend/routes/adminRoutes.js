@@ -6,6 +6,10 @@ import {
   adminUnlockPin,
   resolveAdminWithdrawal,
   getAdminWithdrawalBankStatus,
+  adminCreateOffer,
+  getOfferReport,
+  stopOffer,
+  listAdminOffers,
 } from "../controllers/adminController.js";
 
 const router = express.Router();
@@ -27,5 +31,11 @@ router.post("/withdrawals/:id/resolve", resolveAdminWithdrawal);
 
 // POST /api/v1/admin/users/:id/unlock-pin — staff-only PIN unlock.
 router.post("/users/:id/unlock-pin", adminUnlockPin);
+
+// Day 9: Promotional Offer routes (staff only)
+router.post("/offers", adminCreateOffer);
+router.get("/offers", listAdminOffers);
+router.get("/offers/:code", getOfferReport);
+router.post("/offers/:code/stop", stopOffer);
 
 export default router;

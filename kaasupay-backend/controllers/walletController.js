@@ -380,7 +380,9 @@ const getTransactions = async (req, res) => {
       const txn = entry.transactionId;
       let withWhom = "Bank deposit";
 
-      if (txn && txn.type === "TOPUP") {
+      if (txn && txn.type === "CASHBACK") {
+        withWhom = "Cashback";
+      } else if (txn && txn.type === "TOPUP") {
         withWhom = "Added via Razorpay";
       } else if (txn && txn.type === "WITHDRAWAL") {
         withWhom = "Withdrawal to bank";
@@ -480,7 +482,7 @@ const getHistory = async (req, res) => {
 
     // 3. Direction and Type filter validation (Day 8 Level 2)
     const VALID_DIRECTIONS = ["DEBIT", "CREDIT"];
-    const VALID_TYPES = ["TRANSFER", "DEPOSIT", "TOPUP", "WITHDRAWAL", "REVERSAL"];
+    const VALID_TYPES = ["TRANSFER", "DEPOSIT", "TOPUP", "WITHDRAWAL", "REVERSAL", "CASHBACK"];
 
     if (req.query.direction !== undefined) {
       if (!VALID_DIRECTIONS.includes(req.query.direction)) {
@@ -556,7 +558,9 @@ const getHistory = async (req, res) => {
       let withWhom = "Bank deposit";
       const txnType = entry.type || txn?.type || "UNKNOWN";
 
-      if (txnType === "TOPUP") {
+      if (txnType === "CASHBACK") {
+        withWhom = "Cashback";
+      } else if (txnType === "TOPUP") {
         withWhom = "Added via Razorpay";
       } else if (txnType === "WITHDRAWAL") {
         withWhom = "Withdrawal to bank";

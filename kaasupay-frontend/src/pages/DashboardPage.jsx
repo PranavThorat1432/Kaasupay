@@ -15,6 +15,8 @@ import {
   KeyRound,
   Lock,
   LogOut,
+  Sparkles,
+  X,
   } from 'lucide-react';
 import { useAuth, useWallet, useTransactions, useAppDispatch, useToast } from '../store/hooks';
 import { fetchWalletBalance, clearWalletError, fetchDailyLimits } from '../store/slices/walletSlice';
@@ -30,6 +32,7 @@ import { formatDateTime } from '../utils/currency';
 import DailyLimitCard from '../components/security/DailyLimitCard';
 import SetPinModal from '../components/security/SetPinModal';
 import MoneyRequestsSection from '../components/requests/MoneyRequestsSection';
+import rewardService from '../services/rewardService';
 
 export function DashboardPage() {
   const dispatch = useAppDispatch();
@@ -39,12 +42,20 @@ export function DashboardPage() {
   const toast = useToast();
 
   const [isPinModalOpen, setIsPinModalOpen] = useState(false);
+  const [unclaimedCount, setUnclaimedCount] = useState(0);
+  const [isRewardBannerDismissed, setIsRewardBannerDismissed] = useState(false);
   const [isLoggingOutAll, setIsLoggingOutAll] = useState(false);
 
   const handleRefresh = useCallback(() => {
     dispatch(fetchWalletBalance());
     dispatch(fetchDailyLimits());
     dispatch(fetchTransactionHistory({ page: 1, limit: 5 }));
+    rewardService.getCards()
+      .then((res) => {
+        const count = (res.cards || []).filter((c) => c.status === 'UNCLAIMED').length;
+        setUnclaimedCount(count);
+      })
+      .catch(() => {});
   }, [dispatch]);
 
   useEffect(() => {
@@ -90,6 +101,44 @@ export function DashboardPage() {
           </Button>
         </div>
       </div>
+
+      {/* Subtle Unclaimed Rewards Banner (PRD 4.1) */}
+      {unclaimedCount > 0 && !isRewardBannerDismissed && (
+        <div className="p-4 bg-linear-to-r from-amber-500/15 via-amber-400/10 to-transparent border border-amber-300/80 rounded-2xl flex items-center justify-between gap-4 shadow-xs">
+          <div className="flex items-center gap-3">
+            <div className="p-2 rounded-xl bg-amber-500 text-navy-950 shrink-0 shadow-xs">
+              <Sparkles className="w-4 h-4 animate-spin" style={{ animationDuration: '4s' }} />
+            </div>
+            <div>
+              <p className="text-xs sm:text-sm font-bold text-navy-950">
+                You have {unclaimedCount} unclaimed scratch {unclaimedCount === 1 ? 'card' : 'cards'}!
+              </p>
+              <p className="text-[11px] text-slate-500">
+                Scratch to reveal your instant festival promotional cashback
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <Link to="/rewards">
+              <Button
+                variant="primary"
+                size="sm"
+                className="bg-amber-500 text-navy-950 hover:bg-amber-600 border-none font-bold text-xs py-1.5 shadow-xs"
+              >
+                Scratch now →
+              </Button>
+            </Link>
+            <button
+              onClick={() => setIsRewardBannerDismissed(true)}
+              className="cursor-pointer p-1 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-black/5 transition-colors"
+              title="Dismiss banner"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Security Banner if user has no payment PIN */}
       {!user?.hasPin && (

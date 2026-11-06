@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { Outlet, NavLink, Link, useLocation } from 'react-router-dom';
 import {
   Wallet,
@@ -13,18 +13,21 @@ import {
   X,
   ArrowUpRight,
   Landmark,
+  Sparkles,
 } from 'lucide-react';
 import { useAuth, useWallet, useAppDispatch, useAppSelector } from '../../store/hooks';
 import { fetchWalletBalance } from '../../store/slices/walletSlice';
 import { toggleMobileNav, setMobileNavOpen } from '../../store/slices/uiSlice';
 import AmountDisplay from '../ui/AmountDisplay';
 import Button from '../ui/Button';
+import rewardService from '../../services/rewardService';
 
 const navItems = [
   { name: 'Dashboard', path: '/dashboard', icon: LayoutDashboard },
   { name: 'Send Money', path: '/transfer', icon: Send },
   { name: 'Add Money', path: '/add-money', icon: PlusCircle },
   { name: 'Withdraw', path: '/withdraw', icon: ArrowUpRight },
+  { name: 'Rewards', path: '/rewards', icon: Sparkles },
   { name: 'Bank Accounts', path: '/bank-accounts', icon: Landmark },
   { name: 'Transactions', path: '/transactions', icon: History },
 ];
@@ -35,10 +38,17 @@ export function DashboardLayout() {
   const { balance } = useWallet();
   const isMobileNavOpen = useAppSelector((state) => state.ui.isMobileNavOpen);
   const location = useLocation();
+  const [unclaimedCount, setUnclaimedCount] = useState(0);
 
-  // Fetch fresh wallet balance on mount and route changes
+  // Fetch fresh wallet balance and unclaimed rewards count on mount and route changes
   useEffect(() => {
     dispatch(fetchWalletBalance());
+    rewardService.getCards()
+      .then((res) => {
+        const count = (res.cards || []).filter((c) => c.status === 'UNCLAIMED').length;
+        setUnclaimedCount(count);
+      })
+      .catch(() => {});
   }, [dispatch, location.pathname]);
 
   const closeDrawer = () => dispatch(setMobileNavOpen(false));
@@ -110,7 +120,12 @@ export function DashboardLayout() {
                 }
               >
                 <Icon className="w-4 h-4 shrink-0" />
-                <span>{item.name}</span>
+                <span className="flex-1">{item.name}</span>
+                {item.path === '/rewards' && unclaimedCount > 0 && (
+                  <span className="px-1.5 py-0.5 rounded-full text-[10px] font-extrabold bg-amber-500 text-navy-950 animate-pulse">
+                    {unclaimedCount}
+                  </span>
+                )}
               </NavLink>
             );
           })}
@@ -212,7 +227,12 @@ export function DashboardLayout() {
                       }
                     >
                       <Icon className="w-4 h-4" />
-                      <span>{item.name}</span>
+                      <span className="flex-1">{item.name}</span>
+                      {item.path === '/rewards' && unclaimedCount > 0 && (
+                        <span className="px-2 py-0.5 rounded-full text-xs font-extrabold bg-amber-500 text-navy-950">
+                          {unclaimedCount}
+                        </span>
+                      )}
                     </NavLink>
                   );
                 })}
