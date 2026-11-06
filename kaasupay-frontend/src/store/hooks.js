@@ -1,5 +1,5 @@
 import { useDispatch, useSelector } from 'react-redux';
-import { useCallback } from 'react';
+import { useCallback, useMemo } from 'react';
 import { addToast, removeToast } from './slices/uiSlice';
 import { logout } from './slices/authSlice';
 
@@ -86,11 +86,14 @@ export function useToast() {
     [dispatch]
   );
 
-  return {
-    toast,
-    success,
-    error,
-    info,
-    dismiss,
-  };
+  return useMemo(
+    () => ({
+      toast,
+      success,
+      error,
+      info,
+      dismiss,
+    }),
+    [toast, success, error, info, dismiss]
+  );
 }

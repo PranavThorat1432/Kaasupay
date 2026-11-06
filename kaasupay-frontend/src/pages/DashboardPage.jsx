@@ -53,7 +53,7 @@ export function DashboardPage() {
     rewardService.getCards()
       .then((res) => {
         const count = (res.cards || []).filter((c) => c.status === 'UNCLAIMED').length;
-        setUnclaimedCount(count);
+        setUnclaimedCount((prev) => (prev !== count ? count : prev));
       })
       .catch(() => {});
   }, [dispatch]);

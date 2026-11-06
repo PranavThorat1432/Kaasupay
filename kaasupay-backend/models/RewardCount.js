@@ -23,3 +23,4 @@ const rewardCountSchema = new mongoose.Schema(
 rewardCountSchema.index({ userId: 1, day: 1 }, { unique: true });
 
 export default mongoose.model("RewardCount", rewardCountSchema);
+

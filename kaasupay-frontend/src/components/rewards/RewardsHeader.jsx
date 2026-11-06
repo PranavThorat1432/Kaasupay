@@ -50,3 +50,4 @@ export default function RewardsHeader({
     </div>
   );
 }
+

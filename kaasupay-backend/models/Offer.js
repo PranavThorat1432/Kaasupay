@@ -54,3 +54,4 @@ const offerSchema = new mongoose.Schema(
 offerSchema.index({ startsAt: 1, endsAt: 1, isActive: 1 });
 
 export default mongoose.model("Offer", offerSchema);
+

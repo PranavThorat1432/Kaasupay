@@ -207,3 +207,4 @@ Real UPI scratch cards provide variable rewards (e.g. ₹1 to ₹50) with an exp
 1. **Offer State:** Set `isActive = false` and `endsAt = new Date()`. No new payments will receive scratch cards.
 2. **Unclaimed Cards:** Cards already issued represent a contractual commitment to users who performed eligible payments. They remain valid until their individual 7-day `expiresAt` deadline and can be scratched until the remaining `budgetLeft` is exhausted.
 3. **Remaining Promo Budget:** The money remaining in the Promo System Wallet is company capital. Once all issued cards reach terminal states (`CLAIMED`, `EXHAUSTED`, or `EXPIRED`), staff can execute an administrative sweep transaction transferring unspent funds from the Promo System Wallet back to company operating reserve.
+

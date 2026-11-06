@@ -2,7 +2,7 @@ import { useState, useMemo } from 'react';
 import { Gift, Sparkles, Filter } from 'lucide-react';
 import ScratchCardItem from './ScratchCardItem';
 
-export default function ScratchCardGrid({ cards = [], onSelectCard }) {
+export default function ScratchCardGrid({ cards = [], onSelectCard, isLoading = false }) {
   const [filter, setFilter] = useState('ALL');
 
   const filteredCards = useMemo(() => {
@@ -19,7 +19,7 @@ export default function ScratchCardGrid({ cards = [], onSelectCard }) {
         <div className="flex items-center gap-2">
           <Gift className="w-4 h-4 text-cobalt-600" />
           <h2 className="text-sm font-extrabold uppercase tracking-wider text-navy-950">
-            Your Reward Cards ({filteredCards.length})
+            Your Reward Cards ({isLoading ? '...' : filteredCards.length})
           </h2>
         </div>
 
@@ -46,8 +46,14 @@ export default function ScratchCardGrid({ cards = [], onSelectCard }) {
         </div>
       </div>
 
-      {/* Grid of Cards */}
-      {filteredCards.length === 0 ? (
+      {/* Grid of Cards or Skeleton */}
+      {isLoading ? (
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+          {[1, 2, 3, 4].map((i) => (
+            <div key={i} className="h-44 rounded-2xl bg-slate-200/80 animate-pulse border border-slate-200" />
+          ))}
+        </div>
+      ) : filteredCards.length === 0 ? (
         <div className="p-12 text-center bg-white rounded-2xl border border-slate-200/80 shadow-xs space-y-3">
           <div className="w-14 h-14 mx-auto rounded-full bg-slate-100 text-slate-400 flex items-center justify-center">
             <Gift className="w-7 h-7" />
@@ -73,3 +79,4 @@ export default function ScratchCardGrid({ cards = [], onSelectCard }) {
     </div>
   );
 }
+

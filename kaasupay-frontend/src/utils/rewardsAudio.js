@@ -104,3 +104,4 @@ export function triggerHaptic(pattern = [15, 30, 15]) {
     // Ignore
   }
 }
+

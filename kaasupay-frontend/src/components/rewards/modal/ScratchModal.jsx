@@ -164,3 +164,4 @@ export default function ScratchModal({ card, isOpen, onClose, onClaimComplete })
     </AnimatePresence>
   );
 }
+

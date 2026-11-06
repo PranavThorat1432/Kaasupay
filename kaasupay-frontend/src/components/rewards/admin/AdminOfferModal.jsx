@@ -211,3 +211,4 @@ export default function AdminOfferModal({ isOpen, onClose, onSuccess }) {
     </AnimatePresence>
   );
 }
+

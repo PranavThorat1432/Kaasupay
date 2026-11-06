@@ -21,25 +21,24 @@ export function RewardsPage() {
   const [isAdminOfferOpen, setIsAdminOfferOpen] = useState(false);
   const [isAdminReportOpen, setIsAdminReportOpen] = useState(false);
 
-  const loadData = useCallback(async () => {
+  const loadData = useCallback(async (isInitial = false) => {
     try {
-      setLoading(true);
+      if (isInitial) setLoading(true);
       const [cardsRes, offersRes] = await Promise.all([
         rewardService.getCards().catch(() => ({ cards: [] })),
         rewardService.getActiveOffers().catch(() => ({ offers: [] })),
       ]);
-      setCards(cardsRes.cards || []);
-      setOffers(offersRes.offers || []);
+      setCards(cardsRes?.cards || []);
+      setOffers(offersRes?.offers || []);
     } catch (err) {
       console.error('Failed to load rewards data:', err);
-      toast.error('Unable to sync reward cards');
     } finally {
-      setLoading(false);
+      if (isInitial) setLoading(false);
     }
-  }, [toast]);
+  }, []);
 
   useEffect(() => {
-    loadData();
+    loadData(true);
   }, [loadData]);
 
   // Derived metrics
@@ -81,18 +80,11 @@ export function RewardsPage() {
       <ActiveOfferBanner offers={offers} />
 
       {/* Responsive Grid of Scratch Cards */}
-      {loading ? (
-        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-          {[1, 2, 3, 4].map((i) => (
-            <Skeleton key={i} className="h-44 rounded-2xl w-full" />
-          ))}
-        </div>
-      ) : (
-        <ScratchCardGrid
-          cards={cards}
-          onSelectCard={handleSelectCard}
-        />
-      )}
+      <ScratchCardGrid
+        cards={cards}
+        onSelectCard={handleSelectCard}
+        isLoading={loading}
+      />
 
       {/* Interactive Scratch Card Modal */}
       <ScratchModal
@@ -125,3 +117,4 @@ export function RewardsPage() {
 }
 
 export default RewardsPage;
+
