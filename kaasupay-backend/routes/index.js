@@ -5,6 +5,7 @@ import adminRoutes from "./adminRoutes.js";
 import webhookRoutes from "./webhookRoutes.js";
 import withdrawalRoutes from "./withdrawals.js";
 import requestRoutes from "./requestRoutes.js";
+import rewardRoutes from "./rewardRoutes.js";
 
 const router = express.Router();
 
@@ -19,6 +20,10 @@ router.use("/wallet", walletRoutes);
 // Day 7 Request Money endpoints live under /requests
 // (mounted at /api/v1/requests by index.js).
 router.use("/requests", requestRoutes);
+
+// Day 9 Rewards & Scratch Cards endpoints live under /rewards
+// (mounted at /api/v1/rewards by index.js).
+router.use("/rewards", rewardRoutes);
 
 // Direct alias for withdrawals (mounted at /api/v1/withdrawals)
 router.use("/withdrawals", withdrawalRoutes);
