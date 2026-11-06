@@ -81,6 +81,12 @@ const signup = async (req, res) => {
     const { firstName, lastName, password } = parsed.data;
     const username = parsed.data.username;
 
+    if (username.endsWith("@kaasupay.system")) {
+      return res.status(400).json({
+        error: "Reserved system email address",
+      });
+    }
+
     const existingUser = await User.findOne({ username });
     if (existingUser) {
       return res.status(409).json({
@@ -144,7 +150,7 @@ const signin = async (req, res) => {
     const username = parsed.data.username;
 
     const user = await User.findOne({ username });
-    if (!user) {
+    if (!user || user.role === "SYSTEM_REWARD" || user.username.endsWith("@kaasupay.system")) {
       return res.status(401).json({ error: "Wrong email or password" });
     }
 
