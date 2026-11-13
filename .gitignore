@@ -1,0 +1,20 @@
+# ==========================================
+# LOCAL AI AGENTS & GSD DEVELOPMENT WORKFLOW
+# ==========================================
+
+.agent/
+.agents/
+.gemini/
+.gsd/
+
+adapters/
+docs/
+scripts/
+
+model_capabilities.yaml
+GSD-STYLE.md
+PROJECT_RULES.md
+VERSION
+
+DAY*_ANSWERS.md
+kaasupay-backend/docs/DAY*_ANSWERS.md
