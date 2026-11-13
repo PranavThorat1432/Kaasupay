@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import "dotenv/config";
 import mongoose from "mongoose";
+import { issueRewardCardIfEligible } from "../services/promoService.js";
+import RewardCard from "../models/RewardCard.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PORT = 3125;
@@ -514,6 +516,86 @@ async function main() {
 
     const rewardsAfterStop = await get("/rewards", arunToken);
     check("Arun gets no new card after offer stopped", rewardsAfterStop.data.cards.length === 3);
+
+    // --- Phase 1: Reward Issuance Transaction Safety & Idempotency ---
+    console.log("\n--- Phase 1: Reward Issuance Transaction Safety & Idempotency ---");
+
+    // 1. Existing card retrieved for repeated transactionId (idempotency optimization)
+    const existingCardDoc = await RewardCard.findOne({}).session(null);
+    check("Existing card exists in DB for idempotency test", Boolean(existingCardDoc));
+    if (existingCardDoc) {
+      const retrievedCard = await issueRewardCardIfEligible({
+        payerId: existingCardDoc.userId,
+        recipientId: new mongoose.Types.ObjectId(),
+        paymentAmount: 50000,
+        transactionId: existingCardDoc.transactionId,
+        session: null,
+      });
+      check(
+        "Existing card is retrieved for repeated transactionId (idempotency optimization)",
+        retrievedCard && retrievedCard._id.toString() === existingCardDoc._id.toString()
+      );
+    }
+
+    // 2. Expected business ineligibility returns null
+    const ineligPaymentRes = await issueRewardCardIfEligible({
+      payerId: new mongoose.Types.ObjectId(),
+      recipientId: new mongoose.Types.ObjectId(),
+      paymentAmount: 10, // Far below minPayment
+      transactionId: new mongoose.Types.ObjectId(),
+      session: null,
+    });
+    check("Payment below minimum returns null (expected ineligibility)", ineligPaymentRes === null);
+
+    // 3. Unexpected database errors propagate instead of being swallowed
+    let dbErrorPropagated = false;
+    const testSession = await mongoose.startSession();
+    await testSession.endSession(); // Explicitly end session to trigger MongoExpiredSessionError on use
+    try {
+      await issueRewardCardIfEligible({
+        payerId: new mongoose.Types.ObjectId(),
+        recipientId: new mongoose.Types.ObjectId(),
+        paymentAmount: 50000,
+        transactionId: new mongoose.Types.ObjectId(),
+        session: testSession, // Closed session must propagate error, NOT swallow it!
+      });
+    } catch (err) {
+      dbErrorPropagated = true;
+    }
+    check(
+      "Unexpected database error propagates instead of being swallowed as ineligibility",
+      dbErrorPropagated === true
+    );
+
+    // 4. Failed issuance in transaction rolls back cleanly without partial reward state
+    const abortTxnSession = await mongoose.startSession();
+    const abortTxnId = new mongoose.Types.ObjectId();
+    try {
+      await abortTxnSession.withTransaction(async () => {
+        // Create an uncommitted card inside the transaction
+        await RewardCard.create(
+          [
+            {
+              userId: new mongoose.Types.ObjectId(),
+              offerId: new mongoose.Types.ObjectId(),
+              transactionId: abortTxnId,
+              amount: 500,
+              status: "UNCLAIMED",
+              expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+            },
+          ],
+          { session: abortTxnSession }
+        );
+        // Abort the transaction intentionally
+        throw new Error("Simulated payment transaction abort");
+      });
+    } catch (expectedErr) {
+      // expected
+    } finally {
+      await abortTxnSession.endSession();
+    }
+    const rolledBackCard = await RewardCard.findOne({ transactionId: abortTxnId });
+    check("Aborted transaction leaves no partial reward card in DB", rolledBackCard === null);
 
     await directConn.disconnect();
   } finally {

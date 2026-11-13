@@ -180,94 +180,104 @@ export async function createOfferWithDeposit({ code, percent, maxCashback, minPa
 /**
  * Checks all eligibility rules and issues a reward scratch card if eligible.
  * Designed to run INSIDE the money payment's existing session.
- * Never throws errors that would abort the caller's payment transaction.
+ *
+ * Transaction Safety & Concurrency Rules (Phase 1):
+ * - Checks existing card by transactionId first as an idempotency optimization.
+ * - Expected business ineligibility conditions cleanly return null.
+ * - Technical database and transaction errors propagate to the caller to prevent aborted-session corruption.
+ * - Caller session is propagated across all queries and mutations.
+ * - Authoritative duplicate prevention remains the unique index on transactionId.
  */
 export async function issueRewardCardIfEligible({ payerId, recipientId, paymentAmount, transactionId, session }) {
-  try {
-    const now = new Date();
-
-    // 1. Active Offer Check
-    const offer = await Offer.findOne({
-      isActive: true,
-      startsAt: { $lte: now },
-      endsAt: { $gt: now },
-    })
-      .sort({ createdAt: -1 })
-      .session(session);
-
-    if (!offer) {
-      return null;
+  // Idempotency optimization: if a card already exists for this payment transaction, return it.
+  // Note: This optimization prevents redundant checks and duplicate inserts on retried calls,
+  // but the unique index on transactionId remains the authoritative duplicate-prevention lock.
+  if (transactionId) {
+    const existingCard = await RewardCard.findOne({ transactionId }).session(session);
+    if (existingCard) {
+      return existingCard;
     }
+  }
 
-    // 2. Minimum Payment Check
-    if (paymentAmount < offer.minPayment) {
-      return null;
-    }
+  const now = new Date();
 
-    // 3. Anti-Ping-Pong Check (Level 4 Rule 2)
-    // No card if recipient sent a TRANSFER to payer in the last 24 hours
-    const recentPingPong = await Transaction.findOne({
-      fromUserId: recipientId,
-      toUserId: payerId,
-      type: "TRANSFER",
-      status: "COMPLETED",
-      createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
-    }).session(session);
+  // 1. Active Offer Check (Expected ineligibility -> return null)
+  const offer = await Offer.findOne({
+    isActive: true,
+    startsAt: { $lte: now },
+    endsAt: { $gt: now },
+  })
+    .sort({ createdAt: -1 })
+    .session(session);
 
-    if (recentPingPong) {
-      return null;
-    }
-
-    // 4. Daily Cap Check (Level 4 Rule 1)
-    // At most 3 cards per payer per India day
-    const todayIST = indiaDay();
-
-    try {
-      await RewardCount.updateOne(
-        { userId: payerId, day: todayIST },
-        { $setOnInsert: { cards: 0 } },
-        { upsert: true, session }
-      );
-    } catch (err) {
-      if (err.code !== 11000) throw err;
-    }
-
-    const countDoc = await RewardCount.findOneAndUpdate(
-      { userId: payerId, day: todayIST, cards: { $lt: 3 } },
-      { $inc: { cards: 1 } },
-      { session, returnDocument: "after" }
-    );
-
-    if (!countDoc) {
-      return null; // Already hit 3 cards today
-    }
-
-    // 5. Reward Calculation: rawPaise = floor(paymentAmount * percent / 100)
-    const rawPaise = Math.floor((paymentAmount * offer.percent) / 100);
-    const reward = Math.max(1, Math.min(rawPaise, offer.maxCashback));
-
-    // 6. Insert RewardCard
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-    const [card] = await RewardCard.create(
-      [
-        {
-          userId: payerId,
-          offerId: offer._id,
-          transactionId,
-          amount: reward,
-          status: "UNCLAIMED",
-          expiresAt,
-        },
-      ],
-      { session }
-    );
-
-    return card;
-  } catch (err) {
-    // A scratch card is a bonus; failure to create must never fail the underlying payment.
-    console.error("[issueRewardCardIfEligible] Warning: card creation skipped due to error:", err);
+  if (!offer) {
     return null;
   }
+
+  // 2. Minimum Payment Check (Expected ineligibility -> return null)
+  if (paymentAmount < offer.minPayment) {
+    return null;
+  }
+
+  // 3. Anti-Ping-Pong Check (Level 4 Rule 2) (Expected ineligibility -> return null)
+  // No card if recipient sent a TRANSFER to payer in the last 24 hours
+  const recentPingPong = await Transaction.findOne({
+    fromUserId: recipientId,
+    toUserId: payerId,
+    type: "TRANSFER",
+    status: "COMPLETED",
+    createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+  }).session(session);
+
+  if (recentPingPong) {
+    return null;
+  }
+
+  // 4. Daily Cap Check (Level 4 Rule 1)
+  // At most 3 cards per payer per India day
+  const todayIST = indiaDay();
+
+  try {
+    await RewardCount.updateOne(
+      { userId: payerId, day: todayIST },
+      { $setOnInsert: { cards: 0 } },
+      { upsert: true, session }
+    );
+  } catch (err) {
+    if (err.code !== 11000) throw err;
+  }
+
+  const countDoc = await RewardCount.findOneAndUpdate(
+    { userId: payerId, day: todayIST, cards: { $lt: 3 } },
+    { $inc: { cards: 1 } },
+    { session, returnDocument: "after" }
+  );
+
+  if (!countDoc) {
+    return null; // Already hit 3 cards today (Expected ineligibility -> return null)
+  }
+
+  // 5. Reward Calculation: rawPaise = floor(paymentAmount * percent / 100)
+  const rawPaise = Math.floor((paymentAmount * offer.percent) / 100);
+  const reward = Math.max(1, Math.min(rawPaise, offer.maxCashback));
+
+  // 6. Insert RewardCard (Unique index on transactionId enforces single card per payment)
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  const [card] = await RewardCard.create(
+    [
+      {
+        userId: payerId,
+        offerId: offer._id,
+        transactionId,
+        amount: reward,
+        status: "UNCLAIMED",
+        expiresAt,
+      },
+    ],
+    { session }
+  );
+
+  return card;
 }
 
 /**
