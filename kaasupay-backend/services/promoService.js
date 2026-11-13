@@ -234,27 +234,74 @@ export async function issueRewardCardIfEligible({ payerId, recipientId, paymentA
   }
 
   // 4. Daily Cap Check (Level 4 Rule 1)
-  // At most 3 cards per payer per India day
+  // At most 3 cards per payer per India day.
+  // Concurrency-safe atomic reservation via pipeline update with upsert in one step:
+  // - If doc does not exist, it inserts with cards: 1 (returning null for 'before')
+  // - If doc exists and cards < 3, it increments cards by 1 (returning doc with cards < 3)
+  // - If doc exists and cards >= 3, it leaves cards unchanged (returning doc with cards >= 3)
   const todayIST = indiaDay();
 
+  let beforeDoc;
   try {
-    await RewardCount.updateOne(
+    beforeDoc = await RewardCount.findOneAndUpdate(
       { userId: payerId, day: todayIST },
-      { $setOnInsert: { cards: 0 } },
-      { upsert: true, session }
+      [
+        {
+          $set: {
+            cards: {
+              $cond: {
+                if: { $lt: [{ $ifNull: ["$cards", 0] }, 3] },
+                then: { $add: [{ $ifNull: ["$cards", 0] }, 1] },
+                else: "$cards",
+              },
+            },
+            updatedAt: "$$NOW",
+            createdAt: { $ifNull: ["$createdAt", "$$NOW"] },
+          },
+        },
+      ],
+      {
+        upsert: true,
+        returnDocument: "before",
+        session,
+        updatePipeline: true,
+      }
     );
   } catch (err) {
-    if (err.code !== 11000) throw err;
+    // If running outside a transaction session and hit a rare first-creation upsert race (E11000),
+    // retry once against the newly inserted document.
+    if (!session && err.code === 11000) {
+      beforeDoc = await RewardCount.findOneAndUpdate(
+        { userId: payerId, day: todayIST },
+        [
+          {
+            $set: {
+              cards: {
+                $cond: {
+                  if: { $lt: [{ $ifNull: ["$cards", 0] }, 3] },
+                  then: { $add: [{ $ifNull: ["$cards", 0] }, 1] },
+                  else: "$cards",
+                },
+              },
+              updatedAt: "$$NOW",
+            },
+          },
+        ],
+        {
+          returnDocument: "before",
+          updatePipeline: true,
+        }
+      );
+    } else {
+      // Inside a session, or for unexpected errors, propagate immediately.
+      // In MongoDB transactions, an error aborts the session; propagating allows
+      // the transaction manager (session.withTransaction) to roll back and retry cleanly.
+      throw err;
+    }
   }
 
-  const countDoc = await RewardCount.findOneAndUpdate(
-    { userId: payerId, day: todayIST, cards: { $lt: 3 } },
-    { $inc: { cards: 1 } },
-    { session, returnDocument: "after" }
-  );
-
-  if (!countDoc) {
-    return null; // Already hit 3 cards today (Expected ineligibility -> return null)
+  if (beforeDoc && beforeDoc.cards >= 3) {
+    return null; // Already reached the maximum 3 cards per India day
   }
 
   // 5. Reward Calculation: rawPaise = floor(paymentAmount * percent / 100)
@@ -263,21 +310,37 @@ export async function issueRewardCardIfEligible({ payerId, recipientId, paymentA
 
   // 6. Insert RewardCard (Unique index on transactionId enforces single card per payment)
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-  const [card] = await RewardCard.create(
-    [
-      {
-        userId: payerId,
-        offerId: offer._id,
-        transactionId,
-        amount: reward,
-        status: "UNCLAIMED",
-        expiresAt,
-      },
-    ],
-    { session }
-  );
-
-  return card;
+  try {
+    const [card] = await RewardCard.create(
+      [
+        {
+          userId: payerId,
+          offerId: offer._id,
+          transactionId,
+          amount: reward,
+          status: "UNCLAIMED",
+          expiresAt,
+        },
+      ],
+      session ? { session } : {}
+    );
+    return card;
+  } catch (createErr) {
+    // If running outside a transaction session, compensate by releasing the reserved quota.
+    // Inside a transaction session, session rollback automatically reverts the increment.
+    if (!session) {
+      try {
+        await RewardCount.updateOne(
+          { userId: payerId, day: todayIST, cards: { $gt: 0 } },
+          { $inc: { cards: -1 } }
+        );
+      } catch (compErr) {
+        console.error("[issueRewardCardIfEligible] Warning: compensation decrement failed:", compErr);
+        createErr.compensationError = compErr;
+      }
+    }
+    throw createErr;
+  }
 }
 
 /**

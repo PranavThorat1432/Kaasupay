@@ -7,6 +7,9 @@ import "dotenv/config";
 import mongoose from "mongoose";
 import { issueRewardCardIfEligible } from "../services/promoService.js";
 import RewardCard from "../models/RewardCard.js";
+import RewardCount from "../models/RewardCount.js";
+import Offer from "../models/Offer.js";
+import { indiaDay } from "../services/dailyLimitService.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PORT = 3125;
@@ -596,6 +599,262 @@ async function main() {
     }
     const rolledBackCard = await RewardCard.findOne({ transactionId: abortTxnId });
     check("Aborted transaction leaves no partial reward card in DB", rolledBackCard === null);
+
+    // --- Phase 2: Daily Counter Concurrency & Abuse Prevention ---
+    console.log("\n--- Phase 2: Daily Counter Concurrency & Abuse Prevention ---");
+
+    // 0. Verify RewardCount unique index exists in MongoDB
+    await RewardCount.init();
+    const countIndexes = await RewardCount.collection.indexes();
+    const hasUniqueIndex = countIndexes.some(
+      (idx) => idx.unique && idx.key.userId === 1 && idx.key.day === 1
+    );
+    check("RewardCount unique compound index { userId: 1, day: 1 } exists in database", hasUniqueIndex);
+
+    // Create an active offer for Phase 2 testing
+    const p2Offer = await Offer.create({
+      code: "PHASE2_CAP",
+      percent: 10,
+      maxCashback: 5000,
+      minPayment: 1000,
+      budget: 1000000,
+      budgetLeft: 1000000,
+      startsAt: new Date(Date.now() - 60000),
+      endsAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      isActive: true,
+    });
+    check("Phase 2 test offer created", Boolean(p2Offer));
+
+    const todayIST = indiaDay();
+    const testUserA = new mongoose.Types.ObjectId();
+    const testRecipient = new mongoose.Types.ObjectId();
+
+    // 1. First counter creation
+    const p2Card1 = await issueRewardCardIfEligible({
+      payerId: testUserA,
+      recipientId: testRecipient,
+      paymentAmount: 5000,
+      transactionId: new mongoose.Types.ObjectId(),
+      session: null,
+    });
+    check("First reward issuance succeeds for fresh user", Boolean(p2Card1));
+    const countDoc1 = await RewardCount.findOne({ userId: testUserA, day: todayIST });
+    check("First counter document created with cards: 1", countDoc1 && countDoc1.cards === 1);
+
+    // 2. Multiple repeated rounds of concurrent first-creation attempts
+    console.log("Running 5 repeated rounds of 6 concurrent transaction reward issuance attempts...");
+    async function attemptIssuanceInTxn(uId, amt) {
+      const sess = await mongoose.startSession();
+      try {
+        let cardResult = null;
+        await sess.withTransaction(async () => {
+          cardResult = await issueRewardCardIfEligible({
+            payerId: uId,
+            recipientId: new mongoose.Types.ObjectId(),
+            paymentAmount: amt,
+            transactionId: new mongoose.Types.ObjectId(),
+            session: sess,
+          });
+        });
+        return cardResult;
+      } finally {
+        await sess.endSession();
+      }
+    }
+
+    let allRoundsPassed = true;
+    for (let round = 0; round < 5; round++) {
+      const roundUser = new mongoose.Types.ObjectId();
+      const roundAttempts = await Promise.all([
+        attemptIssuanceInTxn(roundUser, 5000),
+        attemptIssuanceInTxn(roundUser, 5000),
+        attemptIssuanceInTxn(roundUser, 5000),
+        attemptIssuanceInTxn(roundUser, 5000),
+        attemptIssuanceInTxn(roundUser, 5000),
+        attemptIssuanceInTxn(roundUser, 5000),
+      ]);
+      const roundWins = roundAttempts.filter(Boolean).length;
+      const roundCountDoc = await RewardCount.findOne({ userId: roundUser, day: todayIST });
+      if (roundWins !== 3 || !roundCountDoc || roundCountDoc.cards !== 3) {
+        allRoundsPassed = false;
+      }
+    }
+    check("All 5 repeated rounds granted exactly 3 cards and capped at 3 under concurrent transactions", allRoundsPassed);
+
+    // Single-batch verification on testUserB
+    const testUserB = new mongoose.Types.ObjectId();
+    const concurrentResults = await Promise.all([
+      attemptIssuanceInTxn(testUserB, 5000),
+      attemptIssuanceInTxn(testUserB, 5000),
+      attemptIssuanceInTxn(testUserB, 5000),
+      attemptIssuanceInTxn(testUserB, 5000),
+      attemptIssuanceInTxn(testUserB, 5000),
+    ]);
+
+    const successfulCards = concurrentResults.filter(Boolean);
+    const cappedCards = concurrentResults.filter((c) => c === null);
+
+    check("Exactly 3 cards granted under concurrent transactions", successfulCards.length === 3);
+    check("Exactly 2 requests denied due to daily cap (null)", cappedCards.length === 2);
+
+    const userBCountDoc = await RewardCount.findOne({ userId: testUserB, day: todayIST });
+    check("User B RewardCount is exactly 3", userBCountDoc && userBCountDoc.cards === 3);
+
+    // 3. Repeated request with same transactionId does not increment counter
+    const repeatTxnId = successfulCards[0].transactionId;
+    const repeatedCard = await issueRewardCardIfEligible({
+      payerId: testUserB,
+      recipientId: new mongoose.Types.ObjectId(),
+      paymentAmount: 5000,
+      transactionId: repeatTxnId,
+      session: null,
+    });
+    check(
+      "Repeated transactionId returns existing card without overcounting",
+      repeatedCard && repeatedCard._id.toString() === successfulCards[0]._id.toString()
+    );
+    const userBCountAfterRepeat = await RewardCount.findOne({ userId: testUserB, day: todayIST });
+    check("User B RewardCount remains 3 after repeated request", userBCountAfterRepeat.cards === 3);
+
+    // 4. Failed card creation does not permanently consume slot (transaction rollback)
+    const testUserC = new mongoose.Types.ObjectId();
+    const rollbackSession = await mongoose.startSession();
+    try {
+      await rollbackSession.withTransaction(async () => {
+        await issueRewardCardIfEligible({
+          payerId: testUserC,
+          recipientId: new mongoose.Types.ObjectId(),
+          paymentAmount: 5000,
+          transactionId: new mongoose.Types.ObjectId(),
+          session: rollbackSession,
+        });
+        throw new Error("Simulated payment failure inside transaction");
+      });
+    } catch {
+      // expected transaction rollback
+    } finally {
+      await rollbackSession.endSession();
+    }
+    const userCCount = await RewardCount.findOne({ userId: testUserC, day: todayIST });
+    check("Failed issuance inside transaction leaves no counter doc or consumption", userCCount === null);
+
+    // 5. Non-session compensation coverage (Issue 2)
+    console.log("Testing non-session compensation scenarios...");
+    const testUserD = new mongoose.Types.ObjectId();
+    const freshTxnId = new mongoose.Types.ObjectId();
+
+    let nonSessionCreateError = null;
+    const origCreateMethod = RewardCard.create;
+    try {
+      // Mock RewardCard.create to fail with E11000 or write error
+      RewardCard.create = async () => {
+        const err = new Error("Simulated duplicate key on concurrent insert race");
+        err.code = 11000;
+        throw err;
+      };
+
+      await issueRewardCardIfEligible({
+        payerId: testUserD,
+        recipientId: new mongoose.Types.ObjectId(),
+        paymentAmount: 5000,
+        transactionId: freshTxnId,
+        session: null,
+      });
+    } catch (err) {
+      nonSessionCreateError = err;
+    } finally {
+      RewardCard.create = origCreateMethod;
+    }
+
+    check(
+      "RewardCard.create failure outside session throws error",
+      nonSessionCreateError !== null && nonSessionCreateError.code === 11000
+    );
+    const userDCountAfterComp = await RewardCount.findOne({ userId: testUserD, day: todayIST });
+    check(
+      "Non-session compensation released reserved slot back to 0",
+      userDCountAfterComp && userDCountAfterComp.cards === 0
+    );
+
+    // 6. Non-session compensation cannot decrement below zero
+    await RewardCount.updateOne(
+      { userId: testUserD, day: todayIST, cards: { $gt: 0 } },
+      { $inc: { cards: -1 } }
+    );
+    const userDCountStillZero = await RewardCount.findOne({ userId: testUserD, day: todayIST });
+    check("Compensation operation cannot decrement counter below zero", userDCountStillZero.cards === 0);
+
+    // 7. Non-session compensation does not remove concurrent successful reservation
+    const testUserE = new mongoose.Types.ObjectId();
+    // Pre-seed 1 card for User E
+    await RewardCount.create({ userId: testUserE, day: todayIST, cards: 1 });
+    // Fail an issuance for User E outside session
+    try {
+      RewardCard.create = async () => {
+        throw new Error("Simulated card create error");
+      };
+      await issueRewardCardIfEligible({
+        payerId: testUserE,
+        recipientId: new mongoose.Types.ObjectId(),
+        paymentAmount: 5000,
+        transactionId: new mongoose.Types.ObjectId(),
+        session: null,
+      });
+    } catch {
+      // expected
+    } finally {
+      RewardCard.create = origCreateMethod;
+    }
+    const userECount = await RewardCount.findOne({ userId: testUserE, day: todayIST });
+    check(
+      "Compensation only removes its own reserved slot (reverts from 2 to 1, preserving existing slot)",
+      userECount && userECount.cards === 1
+    );
+
+    // 8. Compensation failure handling: original creation error remains identifiable
+    const origRewardCardCreate = RewardCard.create;
+    const origRewardCountUpdateOne = RewardCount.updateOne;
+    let thrownErrorWithCompFailure = null;
+
+    try {
+      // Mock RewardCard.create to fail
+      RewardCard.create = async () => {
+        throw new Error("Simulated card creation network timeout");
+      };
+      // Mock RewardCount.updateOne to also fail during compensation
+      RewardCount.updateOne = async () => {
+        throw new Error("Simulated DB connection failure during compensation");
+      };
+
+      await issueRewardCardIfEligible({
+        payerId: new mongoose.Types.ObjectId(),
+        recipientId: new mongoose.Types.ObjectId(),
+        paymentAmount: 5000,
+        transactionId: new mongoose.Types.ObjectId(),
+        session: null,
+      });
+    } catch (err) {
+      thrownErrorWithCompFailure = err;
+    } finally {
+      RewardCard.create = origRewardCardCreate;
+      RewardCount.updateOne = origRewardCountUpdateOne;
+    }
+
+    check(
+      "Original creation error remains thrown when compensation fails",
+      thrownErrorWithCompFailure && thrownErrorWithCompFailure.message === "Simulated card creation network timeout"
+    );
+    check(
+      "Compensation failure details attached without losing original error",
+      thrownErrorWithCompFailure &&
+        thrownErrorWithCompFailure.compensationError &&
+        thrownErrorWithCompFailure.compensationError.message === "Simulated DB connection failure during compensation"
+    );
+
+    // 9. India calendar-day calculation check
+    const nowUTC = new Date("2026-11-13T19:00:00.000Z"); // 7:00 PM UTC = 00:30 AM next day IST (2026-11-14)
+    const istDay = indiaDay(nowUTC);
+    check("India calendar-day calculation rolls over at 18:30 UTC", istDay === "2026-11-14");
 
     await directConn.disconnect();
   } finally {
