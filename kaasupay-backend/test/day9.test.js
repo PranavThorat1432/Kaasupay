@@ -1457,6 +1457,264 @@ async function main() {
       conflictDbCard && conflictDbCard.status === "UNCLAIMED"
     );
 
+    // --- Phase 5: Expanded Reward Concurrency & System Regression Coverage ---
+    console.log("\n--- Phase 5: Expanded Reward Concurrency & System Regression Coverage ---");
+
+    // 1. Full Day 7 Request Money Payment Lifecycle with Reward Issuance
+    const p5OfferRes = await post(
+      "/admin/offers",
+      {
+        code: "REGRESS5",
+        percent: 5,
+        maxCashback: 5000,
+        minPayment: 10000,
+        budget: 500000,
+        days: 7,
+      },
+      null,
+      { "x-admin-key": ADMIN_KEY }
+    );
+    check("POST /admin/offers REGRESS5 created and funded -> 201", p5OfferRes.status === 201);
+
+    // Create fresh test users for clean daily limits and isolation
+    const p5PayerSignup = await post("/user/signup", {
+      username: "p5payer@test.local",
+      firstName: "P5Payer",
+      lastName: "User",
+      password: "password123",
+    });
+    check("P5 Payer signup -> 201", p5PayerSignup.status === 201);
+    const p5PayerSignin = await post("/user/signin", {
+      username: "p5payer@test.local",
+      password: "password123",
+    });
+    const p5PayerToken = p5PayerSignin.data.token;
+    const p5PayerId = p5PayerSignup.data.user._id;
+
+    const p5RequesterSignup = await post("/user/signup", {
+      username: "p5requester@test.local",
+      firstName: "P5Requester",
+      lastName: "User",
+      password: "password123",
+    });
+    check("P5 Requester signup -> 201", p5RequesterSignup.status === 201);
+    const p5RequesterSignin = await post("/user/signin", {
+      username: "p5requester@test.local",
+      password: "password123",
+    });
+    const p5RequesterToken = p5RequesterSignin.data.token;
+    const p5RequesterId = p5RequesterSignup.data.user._id;
+
+    // Set strong PINs (avoiding repetitive or common sequences)
+    const setP5PayerPin = await post("/user/pin", { password: "password123", pin: "2468" }, p5PayerToken);
+    check("Set P5 Payer PIN -> 200", setP5PayerPin.status === 200);
+    const setP5ReqPin = await post("/user/pin", { password: "password123", pin: "1357" }, p5RequesterToken);
+    check("Set P5 Requester PIN -> 200", setP5ReqPin.status === 200);
+
+    // Fund Payer wallet via staff deposit: ₹5,000 (500000 paise)
+    const payerDepositRes = await post(
+      "/admin/deposit",
+      { to: "p5payer@test.local", amount: 500000, note: "P5 seed deposit" },
+      null,
+      { "x-admin-key": ADMIN_KEY }
+    );
+    check("Fund P5 Payer wallet -> 201", payerDepositRes.status === 201);
+
+    // A. Create Money Request from P5Requester to P5Payer for ₹300 (30000 paise)
+    const createReqRes = await post(
+      "/requests",
+      { to: p5PayerId, amount: 30000, note: "Dinner split request" },
+      p5RequesterToken
+    );
+    check("Create money request -> 201", createReqRes.status === 201);
+    const p5RequestId = createReqRes.data.request.id || createReqRes.data.request._id;
+
+    // B. Pay the Money Request
+    const payReqRes = await post(
+      `/requests/${p5RequestId}/pay`,
+      { pin: "2468" },
+      p5PayerToken,
+      { "idempotency-key": "p5-pay-key-1" }
+    );
+    check("Pay money request -> 200", payReqRes.status === 200);
+    check("Pay request response contains transactionId", Boolean(payReqRes.data.transactionId));
+
+    // C. Verify Reward Card Issued to Payer
+    const p5PayerRewards = await get("/rewards", p5PayerToken);
+    check("P5 Payer GET /rewards returns 200", p5PayerRewards.status === 200);
+    check("P5 Payer has exactly 1 reward card from request payment", p5PayerRewards.data.cards.length === 1);
+    const p5ReqCard = p5PayerRewards.data.cards[0];
+    check("Request reward card status is UNCLAIMED", p5ReqCard?.status === "UNCLAIMED");
+    check("Request reward card amount is obfuscated (null)", p5ReqCard?.amount === null);
+    check("Request reward card offer matches REGRESS5", p5ReqCard?.offer === "REGRESS5");
+
+    // D. Idempotency Replay on payRequest does not duplicate card or debit
+    const replayPayReqRes = await post(
+      `/requests/${p5RequestId}/pay`,
+      { pin: "2468" },
+      p5PayerToken,
+      { "idempotency-key": "p5-pay-key-1" }
+    );
+    check("Replay paid request with same idempotency key returns 200", replayPayReqRes.status === 200);
+    const p5PayerRewardsReplay = await get("/rewards", p5PayerToken);
+    check("No duplicate reward card created on idempotency replay", p5PayerRewardsReplay.data.cards.length === 1);
+
+    // E. Request below minPayment: Request ₹50 (5000 paise)
+    const smallReqRes = await post(
+      "/requests",
+      { to: p5PayerId, amount: 5000, note: "Small tea request" },
+      p5RequesterToken
+    );
+    check("Create small request -> 201", smallReqRes.status === 201);
+    const smallReqId = smallReqRes.data.request.id || smallReqRes.data.request._id;
+    const smallPayRes = await post(
+      `/requests/${smallReqId}/pay`,
+      { pin: "2468" },
+      p5PayerToken,
+      { "idempotency-key": "p5-small-pay-1" }
+    );
+    check("Pay small request succeeds -> 200", smallPayRes.status === 200);
+    const p5PayerRewardsAfterSmall = await get("/rewards", p5PayerToken);
+    check("No card issued for request payment under minPayment", p5PayerRewardsAfterSmall.data.cards.length === 1);
+
+    // F. Anti-Ping-Pong on Request Payments:
+    // P5Payer sent money to P5Requester.
+    // If P5Payer now creates a request to P5Requester, and P5Requester pays P5Payer:
+    // Since P5Payer sent money to P5Requester within 24h, P5Requester is paying someone who sent them money!
+    // Fund P5Requester first
+    await post(
+      "/admin/deposit",
+      { to: "p5requester@test.local", amount: 100000, note: "Fund P5Requester" },
+      null,
+      { "x-admin-key": ADMIN_KEY }
+    );
+
+    const pingPongReq = await post(
+      "/requests",
+      { to: p5RequesterId, amount: 20000, note: "Reverse request" },
+      p5PayerToken
+    );
+    check("Create reverse request -> 201", pingPongReq.status === 201);
+    const pingPongReqId = pingPongReq.data.request.id || pingPongReq.data.request._id;
+    const pingPongPayRes = await post(
+      `/requests/${pingPongReqId}/pay`,
+      { pin: "1357" },
+      p5RequesterToken,
+      { "idempotency-key": "p5-pingpong-pay-1" }
+    );
+    check("Reverse request pay succeeds -> 200", pingPongPayRes.status === 200);
+    const p5RequesterRewards = await get("/rewards", p5RequesterToken);
+    check(
+      "Anti-ping-pong stops reward card issuance on request payment within 24h",
+      p5RequesterRewards.data.cards.length === 0
+    );
+
+    // 2. Claim Request Reward Card & Verify Balance Updates
+    const claimP5CardRes = await post(`/rewards/${p5ReqCard.id}/claim`, {}, p5PayerToken);
+    check("Claim request reward card -> 200", claimP5CardRes.status === 200);
+    check("Claim response status is CLAIMED", claimP5CardRes.data.status === "CLAIMED");
+    check("Claim response won 5% of ₹300 = ₹15 (1500 paise)", claimP5CardRes.data.amount === 1500);
+
+    // 3. Double-Entry Ledger & Conservation of Money Across Mixed Streams
+    const p5ReconcileRes = await get("/admin/reconcile", null, { "x-admin-key": ADMIN_KEY });
+    check("Reconcile across P2P transfers, request payments, and claims -> 200", p5ReconcileRes.status === 200);
+    check("Money is conserved across all user and promo wallets", p5ReconcileRes.data.moneyIsConserved === true);
+    check("Zero mismatches in ledger reconciliation", p5ReconcileRes.data.mismatches?.length === 0);
+
+    // 4. Monthly Statement & Cursor History Validation for Cashback Entries
+    const p5HistoryRes = await get("/wallet/history?limit=10", p5PayerToken);
+    check("GET /wallet/history returns 200", p5HistoryRes.status === 200);
+    const cashbackEntries = p5HistoryRes.data.items.filter((item) => item.type === "CASHBACK");
+    check("Wallet history contains CASHBACK entries", cashbackEntries.length >= 1);
+    check("Cashback entry has label 'Cashback'", cashbackEntries[0].label === "Cashback");
+    check("Cashback entry has direction 'CREDIT'", cashbackEntries[0].direction === "CREDIT");
+
+    const currentYearMonth = new Date().toISOString().slice(0, 7);
+    const p5StatementRes = await get(`/wallet/statement?month=${currentYearMonth}`, p5PayerToken);
+    check("GET /wallet/statement for current month -> 200", p5StatementRes.status === 200);
+    check("Statement check formula holds (openingBalance + totalIn - totalOut === closingBalance)", p5StatementRes.data.check === true);
+    check("Statement totalIn includes cashback credits", p5StatementRes.data.totalIn >= 1500);
+
+    // 5. High-Concurrency Multi-User Stress Test
+    // Create 10 distinct fresh users, seed each with ₹1,000, and execute 10 simultaneous transfers
+    console.log("Blasting 10 concurrent P2P transfers across distinct users...");
+    const stressUserTokens = [];
+    const stressUserIds = [];
+
+    for (let i = 0; i < 10; i++) {
+      const ipHeader = { "x-forwarded-for": `10.0.9.${i + 10}` };
+      const uEmail = `stressuser_${i}_${Date.now()}@test.local`;
+      const uRes = await post(
+        "/user/signup",
+        {
+          username: uEmail,
+          firstName: `Stress${i}`,
+          lastName: "Runner",
+          password: "password123",
+        },
+        null,
+        ipHeader
+      );
+      check(`Stress user ${i} signup -> 201`, uRes.status === 201);
+      const uSignin = await post(
+        "/user/signin",
+        {
+          username: uEmail,
+          password: "password123",
+        },
+        null,
+        ipHeader
+      );
+      stressUserTokens.push(uSignin.data.token);
+      stressUserIds.push(uRes.data.user._id);
+
+      await post("/user/pin", { password: "password123", pin: "7419" }, uSignin.data.token, ipHeader);
+      await post(
+        "/admin/deposit",
+        { to: uEmail, amount: 100000, note: "Stress seed" },
+        null,
+        { "x-admin-key": ADMIN_KEY }
+      );
+    }
+
+    // Fire 10 simultaneous transfers from stress users to P5Requester
+    const stressTransfers = await Promise.all(
+      stressUserTokens.map((token, idx) =>
+        post(
+          "/wallet/transfer",
+          { to: "p5requester@test.local", amount: 20000, pin: "7419", note: `Stress transfer ${idx}` },
+          token,
+          { "idempotency-key": `stress-tx-key-${idx}-${Date.now()}`, "x-forwarded-for": `10.0.9.${idx + 10}` }
+        )
+      )
+    );
+
+    const successfulStressTransfers = stressTransfers.filter((r) => r.status === 200);
+    check("All 10 concurrent transfers completed successfully (200)", successfulStressTransfers.length === 10);
+
+    // Verify all 10 got scratch cards
+    const stressRewards = await Promise.all(
+      stressUserTokens.map((token) => get("/rewards", token))
+    );
+    const allGotCards = stressRewards.every((r) => r.status === 200 && r.data.cards.length === 1);
+    check("All 10 concurrent payers received exactly 1 scratch card", allGotCards);
+
+    // Fire 10 simultaneous claims on those 10 cards
+    console.log("Blasting 10 concurrent claims across distinct users...");
+    const stressClaims = await Promise.all(
+      stressRewards.map((r, idx) =>
+        post(`/rewards/${r.data.cards[0].id}/claim`, {}, stressUserTokens[idx])
+      )
+    );
+    const allClaimsSucceeded = stressClaims.every((r) => r.status === 200 && r.data.status === "CLAIMED");
+    check("All 10 concurrent claims succeeded with status CLAIMED", allClaimsSucceeded);
+
+    // Final Reconcile check after high-concurrency blast
+    const postStressReconcile = await get("/admin/reconcile", null, { "x-admin-key": ADMIN_KEY });
+    check("Post-stress reconcile returns 200", postStressReconcile.status === 200);
+    check("Money remains 100% conserved across all wallets after concurrency blast", postStressReconcile.data.moneyIsConserved === true);
+    check("Zero balance mismatches in ledger after concurrency blast", postStressReconcile.data.mismatches?.length === 0);
+
     await directConn.disconnect();
   } finally {
     server.kill("SIGTERM");
