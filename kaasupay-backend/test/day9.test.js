@@ -5,10 +5,14 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import "dotenv/config";
 import mongoose from "mongoose";
-import { issueRewardCardIfEligible } from "../services/promoService.js";
+import { issueRewardCardIfEligible, claimRewardCard } from "../services/promoService.js";
 import RewardCard from "../models/RewardCard.js";
 import RewardCount from "../models/RewardCount.js";
 import Offer from "../models/Offer.js";
+import Wallet from "../models/walletModel.js";
+import Transaction from "../models/transactionModel.js";
+import LedgerEntry from "../models/ledgerEntryModel.js";
+import User from "../models/userModel.js";
 import { indiaDay } from "../services/dailyLimitService.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -1017,6 +1021,441 @@ async function main() {
       if (res !== null) allInvalidRejected = false;
     }
     check("Invalid paymentAmount (NaN, Infinity, string, decimal, <= 0) returns null", allInvalidRejected);
+
+    // --- Phase 4: Claim Transaction and Expiry Reliability ---
+    console.log("\n--- Phase 4: Claim Transaction and Expiry Reliability ---");
+
+    // 1. Expired card state persistence outside transaction
+    const p4ExpiredCard = await RewardCard.create({
+      userId: arunId,
+      offerId: testCalcOffer._id,
+      transactionId: new mongoose.Types.ObjectId(),
+      amount: 1000,
+      status: "UNCLAIMED",
+      expiresAt: new Date(Date.now() - 10000), // expired 10 seconds ago
+    });
+    check("Expired card seeded for test", Boolean(p4ExpiredCard));
+
+    const claimExpiredRes = await post(`/rewards/${p4ExpiredCard._id}/claim`, {}, arunToken);
+    check("Claiming expired card returns 410", claimExpiredRes.status === 410);
+
+    const expiredDbCard = await RewardCard.findById(p4ExpiredCard._id);
+    check("Expired card status is persisted as EXPIRED in DB", expiredDbCard && expiredDbCard.status === "EXPIRED");
+
+    // Subsequent claim on already-marked EXPIRED card also returns 410
+    const claimExpiredRes2 = await post(`/rewards/${p4ExpiredCard._id}/claim`, {}, arunToken);
+    check("Subsequent claim on EXPIRED card returns 410", claimExpiredRes2.status === 410);
+
+    // 2. Conditional update guard: cannot overwrite CLAIMED card
+    const claimedSampleCard = await RewardCard.findOne({ userId: arunId, status: "CLAIMED" });
+    check("Found a previously claimed card to verify conditional update guard", Boolean(claimedSampleCard));
+    if (claimedSampleCard) {
+      const overwriteAttempt = await RewardCard.updateOne(
+        { _id: claimedSampleCard._id, status: "UNCLAIMED", expiresAt: { $lte: new Date() } },
+        { $set: { status: "EXPIRED" } }
+      );
+      check("Conditional expiry update matched 0 documents on CLAIMED card", overwriteAttempt.matchedCount === 0);
+      const refetchedClaimed = await RewardCard.findById(claimedSampleCard._id);
+      check("CLAIMED card was not overwritten by expiry update", refetchedClaimed.status === "CLAIMED");
+    }
+
+    // 3. Ownership and status revalidation inside claim flow
+    // A. Wrong user claiming card
+    const wrongUserCard = await RewardCard.create({
+      userId: arunId,
+      offerId: testCalcOffer._id,
+      transactionId: new mongoose.Types.ObjectId(),
+      amount: 500,
+      status: "UNCLAIMED",
+      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+    });
+    const wrongUserClaimRes = await post(`/rewards/${wrongUserCard._id}/claim`, {}, balaToken);
+    check("Claiming card owned by another user returns 404", wrongUserClaimRes.status === 404);
+
+    // B. Non-existent card ID
+    const fakeCardId = new mongoose.Types.ObjectId();
+    const fakeCardClaimRes = await post(`/rewards/${fakeCardId}/claim`, {}, arunToken);
+    check("Claiming non-existent card returns 404", fakeCardClaimRes.status === 404);
+
+    // C. Invalid ObjectId format
+    const invalidIdRes = await post("/rewards/invalid-id-format/claim", {}, arunToken);
+    check("Claiming invalid cardId format returns 404", invalidIdRes.status === 404);
+
+    // 4. Budget exhaustion behavior: commits EXHAUSTED without moving money
+    const exhaustedOffer = await Offer.create({
+      code: "EXHAUSTOFFER",
+      percent: 10,
+      maxCashback: 5000,
+      minPayment: 100,
+      budget: 1000,
+      budgetLeft: 100, // Only 100 paise left in budget
+      startsAt: new Date(Date.now() - 60000),
+      endsAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      isActive: true,
+    });
+
+    const cardExceedingBudget = await RewardCard.create({
+      userId: balaId,
+      offerId: exhaustedOffer._id,
+      transactionId: new mongoose.Types.ObjectId(),
+      amount: 300, // 300 paise > 100 paise budgetLeft
+      status: "UNCLAIMED",
+      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+    });
+
+    const preExhaustBalaWallet = await Wallet.findOne({ userId: balaId });
+    const preExhaustTxnCount = await Transaction.countDocuments({ type: "CASHBACK" });
+    const preExhaustLedgerCount = await LedgerEntry.countDocuments({ type: "CASHBACK" });
+
+    const exhaustClaimRes = await post(`/rewards/${cardExceedingBudget._id}/claim`, {}, balaToken);
+    check("Exhausted budget claim returns 200", exhaustClaimRes.status === 200);
+    check("Exhausted budget returns exhausted: true", exhaustClaimRes.data.exhausted === true);
+    check("Exhausted budget returns amount: 0", exhaustClaimRes.data.amount === 0);
+    check("Exhausted budget returns status: 'EXHAUSTED'", exhaustClaimRes.data.status === "EXHAUSTED");
+    check("Exhausted budget message: 'Better luck next time'", exhaustClaimRes.data.message === "Better luck next time");
+
+    const exhaustDbCard = await RewardCard.findById(cardExceedingBudget._id);
+    check("Exhausted card persisted in DB with status: EXHAUSTED", exhaustDbCard.status === "EXHAUSTED");
+    check("Exhausted card has claimedAt timestamp", Boolean(exhaustDbCard.claimedAt));
+
+    const postExhaustBalaWallet = await Wallet.findOne({ userId: balaId });
+    check("User wallet balance unchanged on budget exhaustion", postExhaustBalaWallet.balance === preExhaustBalaWallet.balance);
+
+    const postExhaustTxnCount = await Transaction.countDocuments({ type: "CASHBACK" });
+    check("No CASHBACK transaction created on budget exhaustion", postExhaustTxnCount === preExhaustTxnCount);
+
+    const postExhaustLedgerCount = await LedgerEntry.countDocuments({ type: "CASHBACK" });
+    check("No LedgerEntry created on budget exhaustion", postExhaustLedgerCount === preExhaustLedgerCount);
+
+    // Subsequent claim on EXHAUSTED card returns 409
+    const subExhaustClaimRes = await post(`/rewards/${cardExceedingBudget._id}/claim`, {}, balaToken);
+    check("Subsequent claim on EXHAUSTED card returns 409", subExhaustClaimRes.status === 409);
+
+    // 5. Concurrency & Invariants: Simultaneous claims on the same card
+    const simOffer = await Offer.create({
+      code: "SIMCLAIM",
+      percent: 10,
+      maxCashback: 5000,
+      minPayment: 100,
+      budget: 500000,
+      budgetLeft: 500000,
+      startsAt: new Date(Date.now() - 60000),
+      endsAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      isActive: true,
+    });
+
+    const simCard = await RewardCard.create({
+      userId: balaId,
+      offerId: simOffer._id,
+      transactionId: new mongoose.Types.ObjectId(),
+      amount: 1500, // ₹15.00
+      status: "UNCLAIMED",
+      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+    });
+
+    const promoUserRecord = await User.findOne({ username: "rewards@kaasupay.system" });
+    const preSimPromoWallet = await Wallet.findOne({ userId: promoUserRecord._id });
+    const preSimBalaWallet = await Wallet.findOne({ userId: balaId });
+    const preSimTxnCount = await Transaction.countDocuments({ type: "CASHBACK" });
+    const preSimLedgerCount = await LedgerEntry.countDocuments({ type: "CASHBACK" });
+
+    // Fire 6 parallel claim attempts on the exact same card
+    const simClaims = await Promise.all(
+      Array.from({ length: 6 }, () => post(`/rewards/${simCard._id}/claim`, {}, balaToken))
+    );
+
+    const successfulClaims = simClaims.filter((r) => r.status === 200 && r.data.status === "CLAIMED");
+    const conflictClaims = simClaims.filter((r) => r.status === 409);
+
+    check("Simultaneous claims: exactly ONE claim succeeds (200 CLAIMED)", successfulClaims.length === 1);
+    check("Simultaneous claims: all other claims rejected with 409", conflictClaims.length === 5);
+    check("Successful claim won ₹15.00", successfulClaims[0].data.amount === 1500);
+
+    // Verify financial balances and ledger entries
+    const postSimBalaWallet = await Wallet.findOne({ userId: balaId });
+    check(
+      "User wallet credited by exactly card amount (₹15.00)",
+      postSimBalaWallet.balance === preSimBalaWallet.balance + 1500
+    );
+
+    const postSimPromoWallet = await Wallet.findOne({ userId: promoUserRecord._id });
+    check(
+      "Promo wallet debited by exactly card amount (₹15.00)",
+      postSimPromoWallet.balance === preSimPromoWallet.balance - 1500
+    );
+
+    const postSimSimOffer = await Offer.findById(simOffer._id);
+    check(
+      "Offer budgetLeft decremented by exactly card amount (₹15.00)",
+      postSimSimOffer.budgetLeft === 500000 - 1500
+    );
+
+    const postSimTxnCount = await Transaction.countDocuments({ type: "CASHBACK" });
+    check("Exactly ONE CASHBACK transaction created across 6 simultaneous claims", postSimTxnCount === preSimTxnCount + 1);
+
+    const postSimLedgerCount = await LedgerEntry.countDocuments({ type: "CASHBACK" });
+    check("Exactly TWO LedgerEntry records created across 6 simultaneous claims", postSimLedgerCount === preSimLedgerCount + 2);
+
+    const simDbCard = await RewardCard.findById(simCard._id);
+    check("Card marked CLAIMED with cashbackTransactionId set", simDbCard.status === "CLAIMED" && Boolean(simDbCard.cashbackTransactionId));
+    check(
+      "Card marked CLAIMED with valid claimedAt timestamp and cashbackTransactionId",
+      simDbCard.status === "CLAIMED" &&
+        Boolean(simDbCard.cashbackTransactionId) &&
+        Boolean(simDbCard.claimedAt) &&
+        simDbCard.claimedAt instanceof Date
+    );
+
+    const simCashbackTx = await Transaction.findById(simDbCard.cashbackTransactionId);
+    check("Cashback transaction links from promoUser to balaId", simCashbackTx.fromUserId.equals(promoUserRecord._id) && simCashbackTx.toUserId.equals(balaId));
+
+    const simLedgers = await LedgerEntry.find({ transactionId: simCashbackTx._id });
+    check("Exactly 2 ledger entries for the cashback transaction", simLedgers.length === 2);
+    const debitLedger = simLedgers.find((l) => l.direction === "DEBIT");
+    const creditLedger = simLedgers.find((l) => l.direction === "CREDIT");
+    check("Debit ledger entry exists for promo wallet with matching amount", debitLedger && debitLedger.userId.equals(promoUserRecord._id) && debitLedger.amount === 1500);
+    check("Credit ledger entry exists for user wallet with matching amount", creditLedger && creditLedger.userId.equals(balaId) && creditLedger.amount === 1500);
+    check("Ledger entries are perfectly balanced (debit === credit)", debitLedger.amount === creditLedger.amount);
+
+    // 6. Insufficient promo wallet funds rolls back transaction cleanly
+    const insufficientOffer = await Offer.create({
+      code: "INSUFFOFFER",
+      percent: 10,
+      maxCashback: 5000,
+      minPayment: 100,
+      budget: 100000,
+      budgetLeft: 100000,
+      startsAt: new Date(Date.now() - 60000),
+      endsAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      isActive: true,
+    });
+
+    const rollbackCard = await RewardCard.create({
+      userId: balaId,
+      offerId: insufficientOffer._id,
+      transactionId: new mongoose.Types.ObjectId(),
+      amount: 2000,
+      status: "UNCLAIMED",
+      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+    });
+
+    // Temporarily drain promo wallet to 0
+    const originalPromoBalance = postSimPromoWallet.balance;
+    await Wallet.updateOne({ _id: postSimPromoWallet._id }, { $set: { balance: 0 } });
+
+    const preRollbackBalaBal = (await Wallet.findOne({ userId: balaId })).balance;
+    const preRollbackTxnCount = await Transaction.countDocuments({ type: "CASHBACK" });
+
+    const failClaimRes = await post(`/rewards/${rollbackCard._id}/claim`, {}, balaToken);
+    check("Claim with insufficient promo wallet funds returns 500", failClaimRes.status === 500);
+
+    const rollbackDbCard = await RewardCard.findById(rollbackCard._id);
+    check("Card remains UNCLAIMED after transaction rollback", rollbackDbCard.status === "UNCLAIMED");
+
+    const rolledBackOffer = await Offer.findById(insufficientOffer._id);
+    check("Offer budgetLeft was rolled back and not decremented", rolledBackOffer.budgetLeft === 100000);
+
+    const postRollbackBalaBal = (await Wallet.findOne({ userId: balaId })).balance;
+    check("User wallet balance unchanged after rollback", postRollbackBalaBal === preRollbackBalaBal);
+
+    const postRollbackTxnCount = await Transaction.countDocuments({ type: "CASHBACK" });
+    check("No CASHBACK transaction created after rollback", postRollbackTxnCount === preRollbackTxnCount);
+
+    // Restore promo wallet balance
+    await Wallet.updateOne({ _id: postSimPromoWallet._id }, { $set: { balance: originalPromoBalance } });
+
+    // 7. Item 5 Refinement: Race where concurrent claim occurs between initial read and expiry update
+    const raceExpiryCard = await RewardCard.create({
+      userId: balaId,
+      offerId: simOffer._id,
+      transactionId: new mongoose.Types.ObjectId(),
+      amount: 500,
+      status: "UNCLAIMED",
+      expiresAt: new Date(Date.now() - 5000), // Card expired
+    });
+
+    const origUpdateOne = RewardCard.updateOne;
+    let raceClaimExecuted = false;
+
+    // Intercept updateOne so right before the conditional update to EXPIRED runs,
+    // another transaction claims the card
+    RewardCard.updateOne = async function (filter, update, options) {
+      if (filter && filter._id && filter._id.equals(raceExpiryCard._id) && filter.status === "UNCLAIMED") {
+        if (!raceClaimExecuted) {
+          raceClaimExecuted = true;
+          // Concurrent transaction commits CLAIMED state first!
+          await origUpdateOne.call(RewardCard, { _id: raceExpiryCard._id }, { $set: { status: "CLAIMED" } });
+        }
+      }
+      return origUpdateOne.call(this, filter, update, options);
+    };
+
+    let raceClaimErr = null;
+    try {
+      await claimRewardCard({ cardId: raceExpiryCard._id, userId: balaId });
+    } catch (err) {
+      raceClaimErr = err;
+    } finally {
+      RewardCard.updateOne = origUpdateOne;
+    }
+
+    check(
+      "MatchedCount === 0 re-reads latest card: concurrent claim returns 409 instead of 410",
+      raceClaimErr && raceClaimErr.status === 409 && raceClaimErr.message === "This card is already CLAIMED"
+    );
+
+    // Also test when concurrent request marks it EXHAUSTED
+    const raceExhaustCard = await RewardCard.create({
+      userId: balaId,
+      offerId: simOffer._id,
+      transactionId: new mongoose.Types.ObjectId(),
+      amount: 500,
+      status: "UNCLAIMED",
+      expiresAt: new Date(Date.now() - 5000),
+    });
+
+    let raceExhaustExecuted = false;
+    RewardCard.updateOne = async function (filter, update, options) {
+      if (filter && filter._id && filter._id.equals(raceExhaustCard._id) && filter.status === "UNCLAIMED") {
+        if (!raceExhaustExecuted) {
+          raceExhaustExecuted = true;
+          await origUpdateOne.call(RewardCard, { _id: raceExhaustCard._id }, { $set: { status: "EXHAUSTED" } });
+        }
+      }
+      return origUpdateOne.call(this, filter, update, options);
+    };
+
+    let raceExhaustErr = null;
+    try {
+      await claimRewardCard({ cardId: raceExhaustCard._id, userId: balaId });
+    } catch (err) {
+      raceExhaustErr = err;
+    } finally {
+      RewardCard.updateOne = origUpdateOne;
+    }
+
+    check(
+      "MatchedCount === 0 re-reads latest card: concurrent exhaustion returns 409",
+      raceExhaustErr && raceExhaustErr.status === 409 && raceExhaustErr.message === "This card is already EXHAUSTED"
+    );
+
+    // 8. Item 5 Refinement: Expiry persistence database failure preserves original claim error and makes failure observable
+    const dbFailCard = await RewardCard.create({
+      userId: balaId,
+      offerId: simOffer._id,
+      transactionId: new mongoose.Types.ObjectId(),
+      amount: 500,
+      status: "UNCLAIMED",
+      expiresAt: new Date(Date.now() - 5000),
+    });
+
+    RewardCard.updateOne = async function (filter) {
+      if (filter && filter._id && filter._id.equals(dbFailCard._id)) {
+        throw new Error("Simulated database connection crash during expiry update");
+      }
+      return origUpdateOne.apply(this, arguments);
+    };
+
+    let persistenceFailErr = null;
+    try {
+      await claimRewardCard({ cardId: dbFailCard._id, userId: balaId });
+    } catch (err) {
+      persistenceFailErr = err;
+    } finally {
+      RewardCard.updateOne = origUpdateOne;
+    }
+
+    check(
+      "Original 410 claim error is preserved when expiry persistence encounters DB failure",
+      persistenceFailErr && persistenceFailErr.status === 410 && persistenceFailErr.message === "This card has expired"
+    );
+    check(
+      "Expiry persistence DB failure is observable on error object (expiryPersistenceError)",
+      persistenceFailErr &&
+        persistenceFailErr.expiryPersistenceError &&
+        persistenceFailErr.expiryPersistenceError.message === "Simulated database connection crash during expiry update"
+    );
+
+    // 9. Item 5 Bounded Retry: Claim occurs between second read and retry update
+    const retryRaceCard = await RewardCard.create({
+      userId: balaId,
+      offerId: simOffer._id,
+      transactionId: new mongoose.Types.ObjectId(),
+      amount: 500,
+      status: "UNCLAIMED",
+      expiresAt: new Date(Date.now() - 5000),
+    });
+
+    let updateOneCallCount = 0;
+    RewardCard.updateOne = async function (filter, update, options) {
+      if (filter && filter._id && filter._id.equals(retryRaceCard._id) && filter.status === "UNCLAIMED") {
+        updateOneCallCount += 1;
+        if (updateOneCallCount === 1) {
+          // Attempt 0: simulate 0 matched without changing DB so latestCard reads as UNCLAIMED
+          return { matchedCount: 0, modifiedCount: 0 };
+        }
+        if (updateOneCallCount === 2) {
+          // Attempt 1: simulate concurrent claim occurring right before retry update runs
+          await origUpdateOne.call(RewardCard, { _id: retryRaceCard._id }, { $set: { status: "CLAIMED" } });
+        }
+      }
+      return origUpdateOne.call(this, filter, update, options);
+    };
+
+    let retryRaceErr = null;
+    try {
+      await claimRewardCard({ cardId: retryRaceCard._id, userId: balaId });
+    } catch (err) {
+      retryRaceErr = err;
+    } finally {
+      RewardCard.updateOne = origUpdateOne;
+    }
+
+    check(
+      "Retry update matchedCount === 0 re-reads card: claim between read and retry returns 409",
+      retryRaceErr && retryRaceErr.status === 409 && retryRaceErr.message === "This card is already CLAIMED"
+    );
+
+    // 10. Repeated expiry transition conflicts do not falsely report successful persistence
+    const conflictExpiryCard = await RewardCard.create({
+      userId: balaId,
+      offerId: simOffer._id,
+      transactionId: new mongoose.Types.ObjectId(),
+      amount: 500,
+      status: "UNCLAIMED",
+      expiresAt: new Date(Date.now() - 5000),
+    });
+
+    RewardCard.updateOne = async function (filter, update, options) {
+      if (filter && filter._id && filter._id.equals(conflictExpiryCard._id) && filter.status === "UNCLAIMED") {
+        // Repeatedly simulate conflict (matchedCount 0) while card remains UNCLAIMED in DB
+        return { matchedCount: 0, modifiedCount: 0 };
+      }
+      return origUpdateOne.call(this, filter, update, options);
+    };
+
+    let repeatedConflictErr = null;
+    try {
+      await claimRewardCard({ cardId: conflictExpiryCard._id, userId: balaId });
+    } catch (err) {
+      repeatedConflictErr = err;
+    } finally {
+      RewardCard.updateOne = origUpdateOne;
+    }
+
+    check(
+      "Repeated conflicts do not falsely report successful persistence: observable conflict attached",
+      repeatedConflictErr &&
+        repeatedConflictErr.status === 410 &&
+        repeatedConflictErr.expiryPersistenceError &&
+        repeatedConflictErr.expiryPersistenceError.code === "EXPIRY_PERSISTENCE_CONFLICT"
+    );
+
+    const conflictDbCard = await RewardCard.findById(conflictExpiryCard._id);
+    check(
+      "Card in DB correctly remains UNCLAIMED when persistence conflict could not commit",
+      conflictDbCard && conflictDbCard.status === "UNCLAIMED"
+    );
 
     await directConn.disconnect();
   } finally {

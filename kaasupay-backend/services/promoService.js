@@ -373,20 +373,158 @@ export async function issueRewardCardIfEligible({ payerId, recipientId, paymentA
 }
 
 /**
+ * Safely resolves and persists the EXPIRED state outside a transaction,
+ * inspecting matchedCount on every attempt, re-reading the latest card from
+ * MongoDB when matchedCount is zero, and returning the correct state-specific
+ * error (409 CLAIMED, 409 EXHAUSTED, 410 EXPIRED, 404 missing).
+ * Bounded by MAX_RETRIES to prevent infinite loops.
+ */
+async function persistExpiredStateOrResolve({ cardId, userId }) {
+  const MAX_RETRIES = 3;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    const checkNow = new Date();
+    const updateRes = await RewardCard.updateOne(
+      { _id: cardId, userId, status: "UNCLAIMED", expiresAt: { $lte: checkNow } },
+      { $set: { status: "EXPIRED" } }
+    );
+
+    if (updateRes.matchedCount > 0) {
+      throw new PromoError(410, "This card has expired");
+    }
+
+    // matchedCount === 0: card was concurrently modified, deleted, or already transitioned
+    const latestCard = await RewardCard.findOne({ _id: cardId, userId });
+    if (!latestCard) {
+      throw new PromoError(404, "Card not found");
+    }
+    if (latestCard.status === "CLAIMED") {
+      throw new PromoError(409, "This card is already CLAIMED");
+    }
+    if (latestCard.status === "EXHAUSTED") {
+      throw new PromoError(409, "This card is already EXHAUSTED");
+    }
+    if (latestCard.status === "EXPIRED") {
+      throw new PromoError(410, "This card has expired");
+    }
+    // If still UNCLAIMED and expired, loop retries up to MAX_RETRIES
+    if (latestCard.expiresAt > checkNow) {
+      break;
+    }
+  }
+
+  // Bounded retries exhausted without a successful transition.
+  // Re-read latest card to resolve terminal state:
+  const finalCard = await RewardCard.findOne({ _id: cardId, userId });
+  if (!finalCard) {
+    throw new PromoError(404, "Card not found");
+  }
+  if (finalCard.status === "CLAIMED") {
+    throw new PromoError(409, "This card is already CLAIMED");
+  }
+  if (finalCard.status === "EXHAUSTED") {
+    throw new PromoError(409, "This card is already EXHAUSTED");
+  }
+  if (finalCard.status === "EXPIRED") {
+    throw new PromoError(410, "This card has expired");
+  }
+
+  // If finalCard is still UNCLAIMED and expired, perform one final conditional update
+  const finalNow = new Date();
+  if (finalCard.expiresAt <= finalNow) {
+    const finalUpdateRes = await RewardCard.updateOne(
+      { _id: cardId, userId, status: "UNCLAIMED", expiresAt: { $lte: finalNow } },
+      { $set: { status: "EXPIRED" } }
+    );
+    if (finalUpdateRes.matchedCount > 0) {
+      throw new PromoError(410, "This card has expired");
+    }
+
+    // Re-read once more in case another request concurrently transitioned it
+    const terminalCard = await RewardCard.findOne({ _id: cardId, userId });
+    if (terminalCard) {
+      if (terminalCard.status === "CLAIMED") {
+        throw new PromoError(409, "This card is already CLAIMED");
+      }
+      if (terminalCard.status === "EXHAUSTED") {
+        throw new PromoError(409, "This card is already EXHAUSTED");
+      }
+      if (terminalCard.status === "EXPIRED") {
+        throw new PromoError(410, "This card has expired");
+      }
+    }
+  }
+
+  // The database transition to EXPIRED was NOT committed after bounded retries.
+  // Never falsely report successful persistence: throw an observable concurrency conflict error.
+  const conflictErr = new Error("Unable to persist card expiry after bounded retries due to persistent concurrency conflict");
+  conflictErr.code = "EXPIRY_PERSISTENCE_CONFLICT";
+  throw conflictErr;
+}
+
+/**
  * Claims a scratch card atomically inside a single MongoDB transaction.
+ *
+ * Concurrency & Transaction Rules (Phase 4):
+ * - Validates card ownership, status, and expiry.
+ * - Expiry is persisted outside the financial transaction via conditional update so it commits
+ *   without being rolled back by the 410 error response.
+ * - Conditional update { status: 'UNCLAIMED' } prevents expiry from overwriting a concurrently CLAIMED card.
+ * - Revalidates ownership, status, and expiry inside the transaction snapshot.
+ * - Atomic budget reservation ensures budgetLeft never drops below zero.
+ * - If budget is exhausted, card commits as EXHAUSTED with 200 without moving funds.
+ * - If budget is available, promo wallet is debited, user wallet is credited, exactly one CASHBACK
+ *   transaction is created, exactly two balanced ledger entries are inserted, and card is marked CLAIMED.
+ * - Concurrent claims on the same card cleanly serialize; duplicate claims are rejected with 409.
  */
 export async function claimRewardCard({ cardId, userId }) {
   if (!mongoose.isValidObjectId(cardId)) {
     throw new PromoError(404, "Card not found");
   }
 
+  // Pre-check outside the transaction: validate card ownership and handle expiry persistence
+  const preCard = await RewardCard.findOne({ _id: cardId, userId });
+  if (!preCard) {
+    throw new PromoError(404, "Card not found");
+  }
+
+  if (preCard.status === "CLAIMED") {
+    throw new PromoError(409, "This card is already CLAIMED");
+  }
+
+  if (preCard.status === "EXHAUSTED") {
+    throw new PromoError(409, "This card is already EXHAUSTED");
+  }
+
+  const now = new Date();
+  if (preCard.status === "EXPIRED" || preCard.expiresAt <= now) {
+    if (preCard.status !== "EXPIRED") {
+      let persistenceError = null;
+      try {
+        await persistExpiredStateOrResolve({ cardId, userId });
+      } catch (updateErr) {
+        if (updateErr instanceof PromoError) {
+          throw updateErr;
+        }
+        console.error("[claimRewardCard] Warning: expiry persistence failed:", updateErr);
+        persistenceError = updateErr;
+      }
+
+      const expiryErr = new PromoError(410, "This card has expired");
+      if (persistenceError) {
+        expiryErr.expiryPersistenceError = persistenceError;
+      }
+      throw expiryErr;
+    }
+    throw new PromoError(410, "This card has expired");
+  }
+
   const session = await mongoose.startSession();
   try {
     let result = null;
     await session.withTransaction(async () => {
-      const now = new Date();
+      const txNow = new Date();
 
-      // Step 1: Find Card
+      // Step 1: Revalidate card ownership, status, and expiry inside the transaction snapshot
       const card = await RewardCard.findOne({ _id: cardId, userId }).session(session);
       if (!card) {
         throw new PromoError(404, "Card not found");
@@ -400,11 +538,7 @@ export async function claimRewardCard({ cardId, userId }) {
         throw new PromoError(409, "This card is already EXHAUSTED");
       }
 
-      if (card.status === "EXPIRED" || card.expiresAt <= now) {
-        if (card.status !== "EXPIRED") {
-          card.status = "EXPIRED";
-          await card.save({ session });
-        }
+      if (card.status === "EXPIRED" || card.expiresAt <= txNow) {
         throw new PromoError(410, "This card has expired");
       }
 
@@ -418,7 +552,7 @@ export async function claimRewardCard({ cardId, userId }) {
       // Branch A: Budget Exhausted
       if (!offer) {
         card.status = "EXHAUSTED";
-        card.claimedAt = now;
+        card.claimedAt = txNow;
         await card.save({ session });
 
         result = {
@@ -502,7 +636,7 @@ export async function claimRewardCard({ cardId, userId }) {
 
       // Mark Card CLAIMED
       card.status = "CLAIMED";
-      card.claimedAt = now;
+      card.claimedAt = txNow;
       card.cashbackTransactionId = cashbackTx._id;
       await card.save({ session });
 
@@ -518,6 +652,19 @@ export async function claimRewardCard({ cardId, userId }) {
     });
 
     return result;
+  } catch (err) {
+    if (err && err.status === 410) {
+      try {
+        await persistExpiredStateOrResolve({ cardId, userId });
+      } catch (persistenceErr) {
+        if (persistenceErr instanceof PromoError) {
+          throw persistenceErr;
+        }
+        console.error("[claimRewardCard] Warning: outer expiry persistence failed:", persistenceErr);
+        err.expiryPersistenceError = persistenceErr;
+      }
+    }
+    throw err;
   } finally {
     await session.endSession();
   }
