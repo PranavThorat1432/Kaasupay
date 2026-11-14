@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, Sparkles } from 'lucide-react';
 import ScratchCardCanvas from './ScratchCardCanvas';
@@ -24,6 +24,33 @@ export default function ScratchModal({ card, isOpen, onClose, onClaimComplete })
     Boolean(card && card.status !== 'UNCLAIMED')
   );
   const [showConfetti, setShowConfetti] = useState(false);
+
+  // Responsive card sizing capped for 360px+ screens without clipping
+  const [dimensions, setDimensions] = useState(() => {
+    if (typeof window === 'undefined') return { width: 320, height: 360 };
+    const maxW = Math.min(320, Math.max(260, window.innerWidth - 64));
+    return { width: maxW, height: Math.round(maxW * 1.125) };
+  });
+
+  useEffect(() => {
+    const handleResize = () => {
+      const maxW = Math.min(320, Math.max(260, window.innerWidth - 64));
+      setDimensions({ width: maxW, height: Math.round(maxW * 1.125) });
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  // Close on Escape key
+  useEffect(() => {
+    const handleEscape = (e) => {
+      if (e.key === 'Escape' && isOpen) {
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleEscape);
+    return () => window.removeEventListener('keydown', handleEscape);
+  }, [isOpen, onClose]);
 
   // Trigger claim API call when card is scratched
   const handlePerformClaim = useCallback(async () => {
@@ -134,29 +161,37 @@ export default function ScratchModal({ card, isOpen, onClose, onClaimComplete })
 
   return (
     <AnimatePresence>
-      <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-navy-950/80 backdrop-blur-md">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="scratch-modal-title"
+        className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-navy-950/80 backdrop-blur-md"
+      >
         {showConfetti && <ConfettiBurst onComplete={() => setShowConfetti(false)} />}
 
         <motion.div
           initial={{ y: 50, opacity: 0, scale: 0.95 }}
           animate={{ y: 0, opacity: 1, scale: 1 }}
           exit={{ y: 50, opacity: 0, scale: 0.95 }}
-          className="relative w-full sm:max-w-md bg-white rounded-t-3xl sm:rounded-3xl p-6 shadow-2xl flex flex-col items-center max-h-[90vh] overflow-y-auto"
+          className="relative w-full sm:max-w-md bg-white rounded-t-3xl sm:rounded-3xl p-5 sm:p-6 shadow-2xl flex flex-col items-center max-h-[90vh] overflow-y-auto"
         >
           {/* Header & Close Button */}
           <div className="w-full flex items-center justify-between pb-4 border-b border-slate-100">
             <div className="flex items-center gap-2">
-              <div className="w-8 h-8 rounded-xl bg-amber-100 text-amber-600 flex items-center justify-center">
+              <div className="w-8 h-8 rounded-xl bg-amber-100 text-amber-600 flex items-center justify-center shadow-xs">
                 <Sparkles className="w-4 h-4" />
               </div>
               <div>
-                <h3 className="font-extrabold text-navy-950 text-base">Scratch & Win</h3>
+                <h3 id="scratch-modal-title" className="font-extrabold text-navy-950 text-base">
+                  Scratch & Win
+                </h3>
                 <p className="text-[11px] text-slate-400">Festival Promotional Cashback</p>
               </div>
             </div>
 
             <button
               onClick={onClose}
+              aria-label="Close scratch modal"
               className="cursor-pointer p-2 text-slate-400 hover:text-navy-900 rounded-xl hover:bg-slate-100 transition-colors"
             >
               <X className="w-5 h-5" />
@@ -165,23 +200,26 @@ export default function ScratchModal({ card, isOpen, onClose, onClaimComplete })
 
           {/* Dual-Layer Interactive Scratch Studio */}
           <div className="py-6 flex flex-col items-center">
-            <div className="relative rounded-2xl overflow-hidden shadow-2xl border-4 border-amber-300/40">
+            <div
+              className="relative rounded-2xl overflow-hidden shadow-2xl border-4 border-amber-300/40"
+              style={{ width: `${dimensions.width}px`, height: `${dimensions.height}px` }}
+            >
               {/* Layer 1: Underlying Prize */}
               <RewardRevealView
                 card={card}
                 claimResult={claimResult}
                 isLoadingClaim={isLoadingClaim}
                 isFullyRevealed={isFullyRevealed}
-                width={320}
-                height={360}
+                width={dimensions.width}
+                height={dimensions.height}
                 onRetry={handleRetryClaim}
               />
 
               {/* Layer 2: Scratch Foil (only if card is unclaimed) */}
               {card.status === 'UNCLAIMED' && (
                 <ScratchCardCanvas
-                  width={320}
-                  height={360}
+                  width={dimensions.width}
+                  height={dimensions.height}
                   onFirstScratch={handlePerformClaim}
                   onAutoReveal={handleAutoReveal}
                   isRevealed={isFullyRevealed}

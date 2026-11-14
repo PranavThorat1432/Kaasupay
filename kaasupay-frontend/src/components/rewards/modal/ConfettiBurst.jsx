@@ -8,6 +8,16 @@ export default function ConfettiBurst({ onComplete }) {
   const canvasRef = useRef(null);
 
   useEffect(() => {
+    // Respect reduced-motion preferences: skip particle burst
+    const prefersReducedMotion =
+      typeof window !== 'undefined' &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    if (prefersReducedMotion) {
+      if (onComplete) onComplete();
+      return;
+    }
+
     const canvas = canvasRef.current;
     if (!canvas) return;
 

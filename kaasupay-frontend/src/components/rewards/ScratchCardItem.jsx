@@ -9,14 +9,27 @@ export default function ScratchCardItem({ card, onSelect }) {
   const isExhausted = card.status === 'EXHAUSTED';
   const isExpired = card.status === 'EXPIRED';
 
+  const handleKeyDown = (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      onSelect(card);
+    }
+  };
+
   return (
     <Card
+      role="button"
+      tabIndex={0}
+      aria-label={`${card.offer || 'Festival'} reward card - ${card.status.toLowerCase()}${
+        isClaimed ? `, won ₹${((card.amount || 0) / 100).toFixed(2)}` : ''
+      }`}
+      onKeyDown={handleKeyDown}
       onClick={() => onSelect(card)}
-      className={`group cursor-pointer transition-all duration-300 relative overflow-hidden rounded-2xl border ${
+      className={`group cursor-pointer transition-all duration-300 relative overflow-hidden rounded-2xl border focus:outline-hidden focus:ring-4 focus:ring-amber-400 select-none ${
         isUnclaimed
-          ? 'bg-linear-to-br from-amber-400 via-amber-500 to-amber-600 border-amber-300 shadow-md hover:shadow-xl hover:-translate-y-1'
+          ? 'bg-gradient-to-br from-amber-400 via-amber-500 to-amber-600 border-amber-300/80 shadow-md hover:shadow-xl hover:-translate-y-1 hover:border-amber-200'
           : isClaimed
-          ? 'bg-linear-to-br from-navy-900 to-navy-950 border-emerald-500/30 text-white shadow-xs hover:shadow-md'
+          ? 'bg-gradient-to-br from-navy-900 to-navy-950 border-emerald-500/30 text-white shadow-xs hover:shadow-md hover:border-emerald-500/50'
           : 'bg-slate-100 border-slate-200 text-slate-500 shadow-xs'
       }`}
     >
