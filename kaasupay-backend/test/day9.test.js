@@ -856,6 +856,168 @@ async function main() {
     const istDay = indiaDay(nowUTC);
     check("India calendar-day calculation rolls over at 18:30 UTC", istDay === "2026-11-14");
 
+    // --- Phase 3: Offer Security, Validation & Cashback Calculation ---
+    console.log("\n--- Phase 3: Offer Security, Validation & Cashback Calculation ---");
+
+    // 1. Public active-offers endpoint information filtering
+    const publicOffersRes = await get("/rewards/active-offers", arunToken);
+    check("GET /rewards/active-offers returns 200", publicOffersRes.status === 200);
+    check("Public active-offers returns array", Array.isArray(publicOffersRes.data.offers));
+    const samplePublicOffer = publicOffersRes.data.offers[0];
+    if (samplePublicOffer) {
+      check("Public offer contains code", typeof samplePublicOffer.code === "string");
+      check("Public offer contains percent", typeof samplePublicOffer.percent === "number");
+      check("Public offer contains minPayment", typeof samplePublicOffer.minPayment === "number");
+      check("Public offer contains maxCashback", typeof samplePublicOffer.maxCashback === "number");
+      check("Public offer DOES NOT contain internal budget", samplePublicOffer.budget === undefined);
+      check("Public offer DOES NOT contain internal budgetLeft", samplePublicOffer.budgetLeft === undefined);
+    }
+
+    // 2. Staff report preserves full financial details
+    const staffReportRes = await get("/admin/offers/DIWALI", null, { "x-admin-key": ADMIN_KEY });
+    check("Staff report returns 200", staffReportRes.status === 200);
+    check("Staff report contains budget", typeof staffReportRes.data.budget === "number");
+    check("Staff report contains budgetLeft", typeof staffReportRes.data.budgetLeft === "number");
+    check("Staff report contains totalPaid", typeof staffReportRes.data.totalPaid === "number");
+    check("Staff report contains check flag", typeof staffReportRes.data.check === "boolean");
+
+    // 3. Offer input validation: reject invalid configurations
+    const testCases = [
+      { name: "percent: 0 (below min)", payload: { code: "BADPCT0", percent: 0, maxCashback: 5000, minPayment: 1000, budget: 10000, days: 7 } },
+      { name: "percent: 51 (above max)", payload: { code: "BADPCT51", percent: 51, maxCashback: 5000, minPayment: 1000, budget: 10000, days: 7 } },
+      { name: "percent: 5.5 (non-integer)", payload: { code: "BADPCTDEC", percent: 5.5, maxCashback: 5000, minPayment: 1000, budget: 10000, days: 7 } },
+      { name: "budget: 0", payload: { code: "BADBDG0", percent: 5, maxCashback: 5000, minPayment: 1000, budget: 0, days: 7 } },
+      { name: "budget: -5000 (negative)", payload: { code: "BADBDGNEG", percent: 5, maxCashback: 5000, minPayment: 1000, budget: -5000, days: 7 } },
+      { name: "budget: 100.5 (non-integer)", payload: { code: "BADBDGDEC", percent: 5, maxCashback: 5000, minPayment: 1000, budget: 100.5, days: 7 } },
+      { name: "minPayment: 0", payload: { code: "BADMIN0", percent: 5, maxCashback: 5000, minPayment: 0, budget: 10000, days: 7 } },
+      { name: "maxCashback: 0", payload: { code: "BADMAX0", percent: 5, maxCashback: 0, minPayment: 1000, budget: 10000, days: 7 } },
+      { name: "days: 0", payload: { code: "BADDAY0", percent: 5, maxCashback: 5000, minPayment: 1000, budget: 10000, days: 0 } },
+      { name: "days: 35 (above max 30)", payload: { code: "BADDAY35", percent: 5, maxCashback: 5000, minPayment: 1000, budget: 10000, days: 35 } },
+    ];
+
+    for (const tc of testCases) {
+      const res = await post("/admin/offers", tc.payload, null, { "x-admin-key": ADMIN_KEY });
+      check(`POST /admin/offers rejects ${tc.name} -> 400`, res.status === 400);
+    }
+
+    // 4. Cashback formula verification without artificial 1-paise floor:
+    // Offer: 5% up to ₹50 (5000 paise).
+    // Test: ₹137.05 (13705 paise) -> Math.floor(13705 * 5 / 100) = Math.floor(685.25) = 685 paise (₹6.85)
+    const testCalcOffer = await Offer.create({
+      code: "CALCTEST",
+      percent: 5,
+      maxCashback: 5000,
+      minPayment: 100,
+      budget: 1000000,
+      budgetLeft: 1000000,
+      startsAt: new Date(Date.now() - 60000),
+      endsAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      isActive: true,
+    });
+    check("Calculation test offer created", Boolean(testCalcOffer));
+
+    const calcCard1 = await issueRewardCardIfEligible({
+      payerId: new mongoose.Types.ObjectId(),
+      recipientId: new mongoose.Types.ObjectId(),
+      paymentAmount: 13705, // ₹137.05
+      transactionId: new mongoose.Types.ObjectId(),
+      session: null,
+    });
+    check("5% of 13705 paise rounds down to exactly 685 paise", calcCard1 && calcCard1.amount === 685);
+
+    // Test cap enforcement: 5% of ₹2,000 (200000 paise) = 10000 paise -> capped at 5000 paise (₹50)
+    const calcCard2 = await issueRewardCardIfEligible({
+      payerId: new mongoose.Types.ObjectId(),
+      recipientId: new mongoose.Types.ObjectId(),
+      paymentAmount: 200000, // ₹2,000
+      transactionId: new mongoose.Types.ObjectId(),
+      session: null,
+    });
+    check("Cashback capped at maxCashback (5000 paise)", calcCard2 && calcCard2.amount === 5000);
+
+    // 5. Explicit boundary tests requested in review
+    // Test: ₹100 payment (10000 paise) at 5% -> 500 paise
+    const calcCard100 = await issueRewardCardIfEligible({
+      payerId: new mongoose.Types.ObjectId(),
+      recipientId: new mongoose.Types.ObjectId(),
+      paymentAmount: 10000,
+      transactionId: new mongoose.Types.ObjectId(),
+      session: null,
+    });
+    check("₹100 payment at 5% yields exactly 500 paise (₹5.00)", calcCard100 && calcCard100.amount === 500);
+
+    // Test: ₹100.01 payment (10001 paise) at 5% -> Math.floor(500.05) = 500 paise
+    const calcCard10001 = await issueRewardCardIfEligible({
+      payerId: new mongoose.Types.ObjectId(),
+      recipientId: new mongoose.Types.ObjectId(),
+      paymentAmount: 10001,
+      transactionId: new mongoose.Types.ObjectId(),
+      session: null,
+    });
+    check("₹100.01 payment at 5% rounds down to exactly 500 paise", calcCard10001 && calcCard10001.amount === 500);
+
+    // Test: Valid payment whose proportional cashback rounds down to 0 paise -> ineligible (returns null)
+    const zeroOffer = await Offer.create({
+      code: "ZEROPAY",
+      percent: 5,
+      maxCashback: 5000,
+      minPayment: 10, // 10 paise minimum payment
+      budget: 100000,
+      budgetLeft: 100000,
+      startsAt: new Date(Date.now() - 60000),
+      endsAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      isActive: true,
+    });
+    check("Zero reward test offer created", Boolean(zeroOffer));
+
+    const zeroRewardCard = await issueRewardCardIfEligible({
+      payerId: new mongoose.Types.ObjectId(),
+      recipientId: new mongoose.Types.ObjectId(),
+      paymentAmount: 10, // 10 paise * 5 / 100 = 0.5 paise -> Math.floor = 0
+      transactionId: new mongoose.Types.ObjectId(),
+      session: null,
+    });
+    check("Payment yielding 0 paise cashback returns null (no artificial floor)", zeroRewardCard === null);
+
+    // Deactivate zeroOffer so testCalcOffer (minPayment: 100) becomes active
+    await Offer.updateOne({ _id: zeroOffer._id }, { $set: { isActive: false } });
+
+    // Test: minPayment boundary (100 paise on testCalcOffer)
+    // Exactly at minPayment (100 paise):
+    const atMinCard = await issueRewardCardIfEligible({
+      payerId: new mongoose.Types.ObjectId(),
+      recipientId: new mongoose.Types.ObjectId(),
+      paymentAmount: 100, // 100 * 5 / 100 = 5 paise
+      transactionId: new mongoose.Types.ObjectId(),
+      session: null,
+    });
+    check("Payment exactly at minPayment receives reward card", atMinCard && atMinCard.amount === 5);
+
+    // Exactly 1 paise below minPayment (99 paise):
+    const belowMinCard = await issueRewardCardIfEligible({
+      payerId: new mongoose.Types.ObjectId(),
+      recipientId: new mongoose.Types.ObjectId(),
+      paymentAmount: 99,
+      transactionId: new mongoose.Types.ObjectId(),
+      session: null,
+    });
+    check("Payment 1 paise below minPayment returns null", belowMinCard === null);
+
+    // Test: Invalid paymentAmount values: NaN, Infinity, strings, decimals, zero, negative
+    const invalidAmounts = [NaN, Infinity, -Infinity, "10000", 100.5, 0, -500, null, undefined];
+    let allInvalidRejected = true;
+    for (const invAmt of invalidAmounts) {
+      const res = await issueRewardCardIfEligible({
+        payerId: new mongoose.Types.ObjectId(),
+        recipientId: new mongoose.Types.ObjectId(),
+        paymentAmount: invAmt,
+        transactionId: new mongoose.Types.ObjectId(),
+        session: null,
+      });
+      if (res !== null) allInvalidRejected = false;
+    }
+    check("Invalid paymentAmount (NaN, Infinity, string, decimal, <= 0) returns null", allInvalidRejected);
+
     await directConn.disconnect();
   } finally {
     server.kill("SIGTERM");

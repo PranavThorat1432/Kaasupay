@@ -95,6 +95,25 @@ export async function getOrCreatePromoWallet(session = null) {
  * with full double-entry ledger tracking.
  */
 export async function createOfferWithDeposit({ code, percent, maxCashback, minPayment, budget, days }) {
+  if (!code || typeof code !== "string" || !/^[A-Z0-9]{3,20}$/.test(code.trim().toUpperCase())) {
+    throw new PromoError(400, "Invalid inputs");
+  }
+  if (!Number.isInteger(percent) || percent < 1 || percent > 50) {
+    throw new PromoError(400, "Invalid inputs");
+  }
+  if (!Number.isInteger(maxCashback) || maxCashback < 1) {
+    throw new PromoError(400, "Invalid inputs");
+  }
+  if (!Number.isInteger(minPayment) || minPayment < 1) {
+    throw new PromoError(400, "Invalid inputs");
+  }
+  if (!Number.isInteger(budget) || budget < 1) {
+    throw new PromoError(400, "Invalid inputs");
+  }
+  if (!Number.isInteger(days) || days < 1 || days > 30) {
+    throw new PromoError(400, "Invalid inputs");
+  }
+
   const normalizedCode = code.trim().toUpperCase();
 
   const session = await mongoose.startSession();
@@ -189,6 +208,11 @@ export async function createOfferWithDeposit({ code, percent, maxCashback, minPa
  * - Authoritative duplicate prevention remains the unique index on transactionId.
  */
 export async function issueRewardCardIfEligible({ payerId, recipientId, paymentAmount, transactionId, session }) {
+  // Monetary validity check: paymentAmount must be a positive integer paise
+  if (typeof paymentAmount !== "number" || !Number.isInteger(paymentAmount) || paymentAmount <= 0) {
+    return null;
+  }
+
   // Idempotency optimization: if a card already exists for this payment transaction, return it.
   // Note: This optimization prevents redundant checks and duplicate inserts on retried calls,
   // but the unique index on transactionId remains the authoritative duplicate-prevention lock.
@@ -304,9 +328,14 @@ export async function issueRewardCardIfEligible({ payerId, recipientId, paymentA
     return null; // Already reached the maximum 3 cards per India day
   }
 
-  // 5. Reward Calculation: rawPaise = floor(paymentAmount * percent / 100)
+  // 5. Reward Calculation: Math.min(Math.floor(paymentAmount * percent / 100), maxCashback)
+  // Preserves integer paise and avoids artificial 1-paise floor
   const rawPaise = Math.floor((paymentAmount * offer.percent) / 100);
-  const reward = Math.max(1, Math.min(rawPaise, offer.maxCashback));
+  const reward = Math.min(rawPaise, offer.maxCashback);
+
+  if (reward <= 0) {
+    return null; // Ineligible: zero reward calculation
+  }
 
   // 6. Insert RewardCard (Unique index on transactionId enforces single card per payment)
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
