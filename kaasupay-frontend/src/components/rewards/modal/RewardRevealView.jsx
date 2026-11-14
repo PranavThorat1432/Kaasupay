@@ -1,5 +1,5 @@
 import { motion } from 'framer-motion';
-import { Sparkles, Trophy, Frown, CheckCircle2, ShieldCheck } from 'lucide-react';
+import { Sparkles, Trophy, Frown, CheckCircle2, ShieldCheck, Clock, AlertCircle, RefreshCw } from 'lucide-react';
 import AmountDisplay from '../../ui/AmountDisplay';
 
 /**
@@ -8,12 +8,15 @@ import AmountDisplay from '../../ui/AmountDisplay';
 export default function RewardRevealView({
   card,
   claimResult,
-  isLoadingClaim,
+  isLoadingClaim = false,
   isFullyRevealed,
   width = 320,
   height = 360,
+  onRetry,
 }) {
   const isExhausted = claimResult?.status === 'EXHAUSTED' || card?.status === 'EXHAUSTED';
+  const isExpired = claimResult?.status === 'EXPIRED' || card?.status === 'EXPIRED';
+  const isError = claimResult?.status === 'ERROR';
   const wonAmount = claimResult?.amount ?? (card?.status === 'CLAIMED' ? card.amount : null);
 
   return (
@@ -24,15 +27,19 @@ export default function RewardRevealView({
       {/* Background Decorative Rings */}
       <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(245,158,11,0.18)_0%,transparent_70%)] pointer-events-none" />
 
-      {/* State 1: Scratching in progress (not fully revealed yet) */}
-      {!isFullyRevealed ? (
+      {/* State 1: Scratching in progress or claim in-flight */}
+      {!isFullyRevealed || isLoadingClaim ? (
         <div className="flex flex-col items-center justify-center space-y-4 animate-pulse">
           <div className="w-20 h-20 rounded-full bg-amber-500/10 border border-amber-400/30 flex items-center justify-center text-amber-400">
             <Sparkles className="w-10 h-10 animate-spin" style={{ animationDuration: '6s' }} />
           </div>
           <div>
-            <h4 className="text-lg font-bold text-amber-300">Unlocking Prize...</h4>
-            <p className="text-xs text-slate-400 mt-1">Scratch the card to reveal your reward!</p>
+            <h4 className="text-lg font-bold text-amber-300">
+              {isLoadingClaim ? 'Confirming with Server...' : 'Unlocking Prize...'}
+            </h4>
+            <p className="text-xs text-slate-400 mt-1">
+              {isLoadingClaim ? 'Verifying promotional eligibility' : 'Scratch the card to reveal your reward!'}
+            </p>
           </div>
         </div>
       ) : isExhausted ? (
@@ -61,8 +68,66 @@ export default function RewardRevealView({
             </span>
           </div>
         </motion.div>
+      ) : isExpired ? (
+        /* State 3: Card Expired */
+        <motion.div
+          initial={{ scale: 0.8, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          transition={{ type: 'spring', damping: 15 }}
+          className="flex flex-col items-center space-y-3 z-10"
+        >
+          <div className="w-18 h-18 rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center text-amber-400/80 shadow-md">
+            <Clock className="w-9 h-9" />
+          </div>
+
+          <div className="space-y-1">
+            <h3 className="text-xl font-black text-slate-200">Card Expired</h3>
+            <p className="text-xs text-slate-400 max-w-[240px] mx-auto leading-relaxed">
+              This promotional scratch card was not claimed within its 7-day validity window.
+            </p>
+          </div>
+
+          <div className="pt-3">
+            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-semibold bg-slate-800/80 text-amber-400/80 border border-slate-700">
+              <Clock className="w-3.5 h-3.5" />
+              Claim Window Ended
+            </span>
+          </div>
+        </motion.div>
+      ) : isError ? (
+        /* State 4: Server or Network Error (Card preserved as UNCLAIMED) */
+        <motion.div
+          initial={{ scale: 0.8, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          transition={{ type: 'spring', damping: 15 }}
+          className="flex flex-col items-center space-y-3 z-10"
+        >
+          <div className="w-18 h-18 rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center text-rose-400 shadow-md">
+            <AlertCircle className="w-9 h-9" />
+          </div>
+
+          <div className="space-y-1">
+            <h3 className="text-xl font-black text-slate-200">Connection Interrupted</h3>
+            <p className="text-xs text-slate-400 max-w-[240px] mx-auto leading-relaxed">
+              {claimResult?.message || 'Unable to complete claim right now. Your card remains safe and unclaimed.'}
+            </p>
+          </div>
+
+          {onRetry && (
+            <div className="pt-3">
+              <button
+                type="button"
+                onClick={onRetry}
+                className="cursor-pointer inline-flex items-center gap-1.5 px-4 py-1.5 rounded-full text-xs font-bold bg-amber-500 hover:bg-amber-400 text-navy-950 transition-colors shadow-sm"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                Retry Claim
+              </button>
+            </div>
+          )}
+        </motion.div>
       ) : (
-        /* State 3: Prize Won */
+        /* State 5: Prize Won */
         <motion.div
           initial={{ scale: 0.7, opacity: 0 }}
           animate={{ scale: 1, opacity: 1 }}

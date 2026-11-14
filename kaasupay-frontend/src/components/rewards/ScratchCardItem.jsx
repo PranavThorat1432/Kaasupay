@@ -75,12 +75,12 @@ export default function ScratchCardItem({ card, onSelect }) {
               <h4 className="font-bold text-slate-700 text-xs mt-1">Better luck next time</h4>
               <p className="text-[10px] text-slate-400">Budget pool was exhausted</p>
             </div>
-          ) : (
+          ) : isExpired ? (
             <div className="space-y-1">
               <h4 className="font-bold text-slate-600 text-xs">Card Expired</h4>
               <p className="text-[10px] text-slate-400">Not scratched within 7 days</p>
             </div>
-          )}
+          ) : null}
         </div>
 
         {/* Card Footer */}

@@ -1,6 +1,5 @@
-import { Flame, Sparkles, Clock, Percent, ShieldCheck } from 'lucide-react';
+import { Flame, Clock, Percent } from 'lucide-react';
 import Card, { CardContent } from '../ui/Card';
-import AmountDisplay from '../ui/AmountDisplay';
 
 export default function ActiveOfferBanner({ offers = [] }) {
   if (!offers || offers.length === 0) {

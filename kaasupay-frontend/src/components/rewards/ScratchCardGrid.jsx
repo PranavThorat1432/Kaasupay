@@ -1,5 +1,5 @@
 import { useState, useMemo } from 'react';
-import { Gift, Sparkles, Filter } from 'lucide-react';
+import { Gift } from 'lucide-react';
 import ScratchCardItem from './ScratchCardItem';
 
 export default function ScratchCardGrid({ cards = [], onSelectCard, isLoading = false }) {

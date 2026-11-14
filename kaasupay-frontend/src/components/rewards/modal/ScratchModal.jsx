@@ -1,6 +1,6 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, Sparkles, Check, ArrowRight } from 'lucide-react';
+import { X, Sparkles } from 'lucide-react';
 import ScratchCardCanvas from './ScratchCardCanvas';
 import RewardRevealView from './RewardRevealView';
 import ConfettiBurst from './ConfettiBurst';
@@ -12,68 +12,120 @@ import { fetchWalletBalance } from '../../../store/slices/walletSlice';
 
 export default function ScratchModal({ card, isOpen, onClose, onClaimComplete }) {
   const dispatch = useAppDispatch();
-  const [claimResult, setClaimResult] = useState(null);
+  const isClaimingRef = useRef(false);
+
+  const [claimResult, setClaimResult] = useState(() =>
+    card && card.status !== 'UNCLAIMED'
+      ? { amount: card.amount, status: card.status }
+      : null
+  );
   const [isLoadingClaim, setIsLoadingClaim] = useState(false);
-  const [isFullyRevealed, setIsFullyRevealed] = useState(false);
+  const [isFullyRevealed, setIsFullyRevealed] = useState(() =>
+    Boolean(card && card.status !== 'UNCLAIMED')
+  );
   const [showConfetti, setShowConfetti] = useState(false);
 
-  // If card was already claimed or exhausted in past
-  useEffect(() => {
-    if (card && card.status !== 'UNCLAIMED') {
-      setIsFullyRevealed(true);
-      setClaimResult({
-        amount: card.amount,
-        status: card.status,
-      });
-    } else {
-      setIsFullyRevealed(false);
-      setClaimResult(null);
-      setShowConfetti(false);
+  // Trigger claim API call when card is scratched
+  const handlePerformClaim = useCallback(async () => {
+    if (isClaimingRef.current || !card || card.status !== 'UNCLAIMED') return;
+    if (
+      claimResult &&
+      (claimResult.status === 'CLAIMED' ||
+        claimResult.status === 'EXHAUSTED' ||
+        claimResult.status === 'EXPIRED')
+    ) {
+      return;
     }
-  }, [card]);
 
-  // Trigger claim API call as soon as user first touches/scratches the card
-  const handleFirstScratch = useCallback(async () => {
-    if (!card || card.status !== 'UNCLAIMED' || claimResult || isLoadingClaim) return;
-
+    isClaimingRef.current = true;
     setIsLoadingClaim(true);
+
     try {
       const res = await rewardService.claimCard(card.id || card._id);
       setClaimResult(res);
-      // Immediately refresh wallet balance in Redux store
-      dispatch(fetchWalletBalance());
+
+      // Constraint 6: Only confirmed successful claim with status === "CLAIMED" and amount > 0 may trigger fetchWalletBalance()
+      if (res?.status === 'CLAIMED' && typeof res?.amount === 'number' && res.amount > 0) {
+        dispatch(fetchWalletBalance());
+      }
     } catch (err) {
-      console.error('Failed to claim card on first scratch:', err);
-      // Still set fallback so user is not stuck
-      setClaimResult({
-        message: err.message || 'Error claiming card',
-        amount: 0,
-        status: 'EXHAUSTED',
-      });
+      console.error('Error during card claim:', err);
+
+      // Constraints 4 & 5: Check authoritative backend card state on conflict or ambiguous network/server error
+      if (err.isConflict || err.isNetworkError || err.isServerError) {
+        try {
+          const authCard = await rewardService.getCardById(card.id || card._id);
+          if (authCard && authCard.status !== 'UNCLAIMED') {
+            const resolved = {
+              status: authCard.status,
+              amount: authCard.amount ?? 0,
+              message:
+                authCard.status === 'CLAIMED'
+                  ? 'You won cashback!'
+                  : authCard.status === 'EXHAUSTED'
+                  ? 'Better luck next time'
+                  : 'This card has expired',
+            };
+            setClaimResult(resolved);
+            if (authCard.status === 'CLAIMED' && typeof authCard.amount === 'number' && authCard.amount > 0) {
+              dispatch(fetchWalletBalance());
+            }
+            return;
+          }
+        } catch (syncErr) {
+          console.warn('Failed to synchronize authoritative card state:', syncErr);
+        }
+      }
+
+      // Explicit expired card handling (HTTP 410)
+      if (err.isExpired || err.status === 410) {
+        setClaimResult({
+          status: 'EXPIRED',
+          amount: 0,
+          message: 'This card has expired',
+        });
+      } else {
+        // Constraint 7: Never convert HTTP 500, network errors, timeouts, or connection interruptions into EXHAUSTED
+        setClaimResult({
+          status: 'ERROR',
+          isNetworkError: Boolean(err.isNetworkError),
+          message:
+            err.message || 'Unable to claim reward right now. Your card remains safe and unclaimed.',
+        });
+      }
     } finally {
       setIsLoadingClaim(false);
+      isClaimingRef.current = false;
     }
-  }, [card, claimResult, isLoadingClaim, dispatch]);
+  }, [card, claimResult, dispatch]);
+
+  const handleRetryClaim = useCallback(async () => {
+    setClaimResult(null);
+    await handlePerformClaim();
+  }, [handlePerformClaim]);
 
   // Called when cleared area exceeds 45%
   const handleAutoReveal = useCallback(() => {
     setIsFullyRevealed(true);
     triggerHaptic([30, 60, 30]);
 
-    if (claimResult?.amount > 0 || (card?.amount > 0 && card?.status === 'CLAIMED')) {
+    if (
+      (claimResult?.status === 'CLAIMED' && claimResult?.amount > 0) ||
+      (card?.amount > 0 && card?.status === 'CLAIMED')
+    ) {
       playVictoryChime();
       setShowConfetti(true);
     }
 
     if (onClaimComplete) {
-      onClaimComplete(card?.id, claimResult);
+      onClaimComplete(card?.id || card?._id, claimResult);
     }
   }, [claimResult, card, onClaimComplete]);
 
   // Fallback Manual Scratch button if user prefers instant reveal
   const handleInstantReveal = async () => {
     if (!claimResult) {
-      await handleFirstScratch();
+      await handlePerformClaim();
     }
     handleAutoReveal();
   };
@@ -122,6 +174,7 @@ export default function ScratchModal({ card, isOpen, onClose, onClaimComplete })
                 isFullyRevealed={isFullyRevealed}
                 width={320}
                 height={360}
+                onRetry={handleRetryClaim}
               />
 
               {/* Layer 2: Scratch Foil (only if card is unclaimed) */}
@@ -129,7 +182,7 @@ export default function ScratchModal({ card, isOpen, onClose, onClaimComplete })
                 <ScratchCardCanvas
                   width={320}
                   height={360}
-                  onFirstScratch={handleFirstScratch}
+                  onFirstScratch={handlePerformClaim}
                   onAutoReveal={handleAutoReveal}
                   isRevealed={isFullyRevealed}
                 />
@@ -143,7 +196,7 @@ export default function ScratchModal({ card, isOpen, onClose, onClaimComplete })
                   variant="outline"
                   size="sm"
                   onClick={handleInstantReveal}
-                  className="text-xs text-slate-600"
+                  className="text-xs text-slate-600 cursor-pointer"
                 >
                   Scratch Instantly
                 </Button>
@@ -152,7 +205,7 @@ export default function ScratchModal({ card, isOpen, onClose, onClaimComplete })
                   variant="primary"
                   size="md"
                   onClick={onClose}
-                  className="w-full mt-2 font-bold bg-amber-500 hover:bg-amber-600 border-none text-navy-950 shadow-md"
+                  className="w-full mt-2 font-bold bg-amber-500 hover:bg-amber-600 border-none text-navy-950 shadow-md cursor-pointer"
                 >
                   Done
                 </Button>
