@@ -96,8 +96,6 @@ export async function getActiveOffers(req, res) {
         percent: o.percent,
         maxCashback: o.maxCashback,
         minPayment: o.minPayment,
-        budget: o.budget,
-        budgetLeft: o.budgetLeft,
         startsAt: o.startsAt.toISOString(),
         endsAt: o.endsAt.toISOString(),
       })),

@@ -1,8 +1,7 @@
 import { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, Plus, ShieldCheck, AlertCircle } from 'lucide-react';
+import { X, Plus, AlertCircle } from 'lucide-react';
 import Button from '../../ui/Button';
-import Input from '../../ui/Input';
 import rewardService from '../../../services/rewardService';
 
 export default function AdminOfferModal({ isOpen, onClose, onSuccess }) {
