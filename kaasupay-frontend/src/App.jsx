@@ -22,6 +22,7 @@ const WithdrawPage = lazy(() => import('./pages/WithdrawPage'));
 const BankAccountsPage = lazy(() => import('./pages/BankAccountsPage'));
 const TransactionsPage = lazy(() => import('./pages/TransactionsPage'));
 const RewardsPage = lazy(() => import('./pages/RewardsPage'));
+const AutoPayPage = lazy(() => import('./pages/AutoPayPage'));
 const NotFoundPage = lazy(() => import('./pages/NotFoundPage'));
 
 // Lightweight page loading indicator
@@ -90,6 +91,7 @@ export function App() {
               <Route path="/bank-accounts" element={<BankAccountsPage />} />
               <Route path="/transactions" element={<TransactionsPage />} />
               <Route path="/rewards" element={<RewardsPage />} />
+              <Route path="/autopay" element={<AutoPayPage />} />
             </Route>
 
             {/* Fallback 404 Route */}

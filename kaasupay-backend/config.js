@@ -68,16 +68,49 @@ export function assertRazorpayConfigured() {
 }
 
 /**
- * Validates API-specific configuration (such as Razorpay credentials in production).
+ * Validates API-specific configuration and production security requirements.
  * Called by the backend API entry point (index.js) during startup.
  * Keeps worker processes free from requiring payment credentials.
+ *
+ * Rules enforced:
+ * 1. In production, Razorpay payment credentials must be present.
+ * 2. In production, ALLOW_TIME_TRAVEL must NOT be "true" (fails fast to prevent date manipulation).
+ * 3. In production, CRON_SECRET must be configured and non-empty (fails fast to prevent broken cron).
+ *
+ * Never exposes actual secret values in error messages or logs.
  */
-export function validateApiConfig() {
-  if (process.env.NODE_ENV === "production" && !isRazorpayConfigured) {
-    console.error("Missing required Razorpay payment credentials in production.");
-    console.error("Please configure RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, and RAZORPAY_WEBHOOK_SECRET in .env.");
-    process.exit(1);
+export function validateApiConfig(env = process.env, exitFn = (code) => process.exit(code)) {
+  if (env.NODE_ENV === "production") {
+    // 1. Payment credentials guard
+    const hasRazorpay = Boolean(
+      env.RAZORPAY_KEY_ID && env.RAZORPAY_KEY_SECRET && env.RAZORPAY_WEBHOOK_SECRET
+    );
+    if (!hasRazorpay) {
+      console.error("Missing required Razorpay payment credentials in production.");
+      console.error("Please configure RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, and RAZORPAY_WEBHOOK_SECRET in .env.");
+      exitFn(1);
+      return false;
+    }
+
+    // 2. AutoPay time travel guard: strictly forbidden in production
+    if (env.ALLOW_TIME_TRAVEL === "true") {
+      console.error("Configuration error: ALLOW_TIME_TRAVEL cannot be enabled in production.");
+      console.error("Ensure ALLOW_TIME_TRAVEL is set to 'false' or omitted in production environment.");
+      exitFn(1);
+      return false;
+    }
+
+    // 3. AutoPay cron secret guard: mandatory in production
+    const cronSecret = env.CRON_SECRET;
+    if (!cronSecret || typeof cronSecret !== "string" || cronSecret.trim().length === 0) {
+      console.error("Configuration error: Missing or empty CRON_SECRET in production.");
+      console.error("Please configure CRON_SECRET in your production environment settings.");
+      exitFn(1);
+      return false;
+    }
   }
+
+  return true;
 }
 
 // Request Money expiry duration in days (Day 7: default 7 days)
