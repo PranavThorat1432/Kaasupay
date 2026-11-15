@@ -1,6 +1,7 @@
 import mongoose from "mongoose";
 import Mandate from "../models/mandateModel.js";
 import MandateRun from "../models/mandateRunModel.js";
+import { transfer, MoneyError } from "./money.js";
 import { indiaDay } from "./dailyLimitService.js";
 
 /**
@@ -215,4 +216,187 @@ export async function processMissedMandateRuns(mandate, todayStr) {
     finalNextRunDay: currentNextRunDay,
     eligibleForPayment,
   };
+}
+
+/**
+ * Records a failed payment run and advances the mandate's nextRunDay in an independent transaction.
+ * Automatically pauses the mandate if consecutive failures reach 3.
+ *
+ * @param {object} mandate - Mandate mongoose document or object
+ * @param {string} dueDay - "YYYY-MM-DD"
+ * @param {string} reason - Business failure reason (e.g. "Insufficient balance")
+ * @returns {Promise<{ claimed: boolean, paused: boolean, failedCount: number }|null>}
+ */
+export async function recordFailedMandatePayment(mandate, dueDay, reason) {
+  const failSession = await mongoose.startSession();
+  let result = null;
+
+  try {
+    await failSession.withTransaction(async () => {
+      // 1. Atomically claim this due period for failure
+      const claimed = await Mandate.findOneAndUpdate(
+        { _id: mandate._id, status: "ACTIVE", nextRunDay: dueDay },
+        {
+          $set: { nextRunDay: nextMonthDay(dueDay) },
+          $inc: { failedCount: 1 },
+        },
+        { returnDocument: "after", session: failSession }
+      );
+
+      if (!claimed) {
+        // Another concurrent worker claimed or handled this mandate
+        return;
+      }
+
+      // 2. Automatically change status to PAUSED when third consecutive failure occurs
+      if (claimed.failedCount >= 3) {
+        await Mandate.updateOne(
+          { _id: mandate._id },
+          { $set: { status: "PAUSED" } },
+          { session: failSession }
+        );
+      }
+
+      // 3. Create one FAILED MandateRun record
+      await MandateRun.create(
+        [
+          {
+            mandateId: mandate._id,
+            dueDay,
+            status: "FAILED",
+            amount: mandate.amount,
+            reason: reason || "Payment failed",
+            transactionId: null,
+          },
+        ],
+        { session: failSession }
+      );
+
+      result = {
+        claimed: true,
+        paused: claimed.failedCount >= 3,
+        failedCount: claimed.failedCount,
+      };
+    });
+  } catch (err) {
+    console.error(`[recordFailedMandatePayment] Error recording failure for mandate ${mandate._id}:`, err);
+  } finally {
+    await failSession.endSession();
+  }
+
+  return result;
+}
+
+/**
+ * Processes a single due mandate payment with exactly-once transactional semantics.
+ *
+ * All operations execute inside a single MongoDB transaction:
+ * 1. Lock 1: Atomically claim mandate by matching { _id, status: "ACTIVE", nextRunDay: dueDay }
+ *    and advancing nextRunDay to next month, resetting failedCount to 0.
+ * 2. Transfer: Call shared transfer() with external session (debit payer, credit payee,
+ *    create transaction record with note "AutoPay", create ledger entries, check daily limits,
+ *    evaluate promo cards).
+ * 3. Lock 2: Persist MandateRun record with status "SUCCESS" and transactionId.
+ *
+ * If a business failure occurs (insufficient balance, daily limit, wallet missing):
+ * The transaction aborts completely, and recordFailedMandatePayment() is invoked
+ * in a separate transaction to record the failure, advance nextRunDay, and auto-pause if needed.
+ *
+ * @param {object} mandate - Mandate mongoose document or object
+ * @param {string} dueDay - "YYYY-MM-DD"
+ * @returns {Promise<{ outcome: "SUCCESS"|"FAILED"|"SKIPPED"|"ERROR", transaction?: object, run?: object, reason?: string, paused?: boolean }>}
+ */
+export async function processDueMandatePayment(mandate, dueDay) {
+  const session = await mongoose.startSession();
+  let paymentResult = null;
+  let businessError = null;
+
+  try {
+    await session.withTransaction(async () => {
+      // 1. Lock 1: Atomically claim mandate & advance nextRunDay to next month, reset failedCount: 0
+      const claimed = await Mandate.findOneAndUpdate(
+        { _id: mandate._id, status: "ACTIVE", nextRunDay: dueDay },
+        {
+          $set: {
+            nextRunDay: nextMonthDay(dueDay),
+            failedCount: 0,
+          },
+        },
+        { returnDocument: "after", session }
+      );
+
+      if (!claimed) {
+        // Another concurrent worker claimed this month, or mandate was paused/cancelled
+        paymentResult = { outcome: "SKIPPED" };
+        return;
+      }
+
+      // 2. Financial transfer: call existing transfer() with caller session
+      const transferRes = await transfer({
+        fromUserId: mandate.payerId,
+        toUserId: mandate.payeeId,
+        amount: mandate.amount,
+        note: "AutoPay",
+        session,
+      });
+
+      // 3. Lock 2: Persist MandateRun record
+      const [runDoc] = await MandateRun.create(
+        [
+          {
+            mandateId: mandate._id,
+            dueDay,
+            status: "SUCCESS",
+            amount: mandate.amount,
+            transactionId: transferRes.transaction._id,
+            reason: null,
+          },
+        ],
+        { session }
+      );
+
+      paymentResult = {
+        outcome: "SUCCESS",
+        mandate: claimed,
+        transaction: transferRes.transaction,
+        run: runDoc,
+      };
+    });
+  } catch (err) {
+    // Distinguish business failures from transient infrastructure errors
+    const isBusiness =
+      err instanceof MoneyError ||
+      err.name === "MoneyError" ||
+      err.statusCode === 400 ||
+      err.statusCode === 404 ||
+      err.message === "Insufficient balance" ||
+      err.message === "Daily limit reached" ||
+      err.message === "Receiver wallet not found" ||
+      err.message === "Sender wallet not found";
+
+    if (isBusiness) {
+      businessError = err;
+    } else {
+      console.error(`[processDueMandatePayment] Non-business transaction error for mandate ${mandate._id}:`, err);
+      return { outcome: "ERROR", error: err.message };
+    }
+  } finally {
+    await session.endSession();
+  }
+
+  if (paymentResult) {
+    return paymentResult;
+  }
+
+  if (businessError) {
+    // Execute failure recording in separate transaction
+    const failOutcome = await recordFailedMandatePayment(mandate, dueDay, businessError.message);
+    return {
+      outcome: "FAILED",
+      reason: businessError.message,
+      paused: failOutcome?.paused || false,
+    };
+  }
+
+  return { outcome: "SKIPPED" };
 }

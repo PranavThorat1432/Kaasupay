@@ -361,18 +361,34 @@ async function main() {
     const resDec5 = await get("/cron/autopay?date=2026-12-05", null, cronHeader);
     check("On 2026-12-05: due is 1 (ACTIVE on-time selected, PAUSED/CANCELLED excluded)", resDec5.data.due === 1);
 
+    // Reset mandate nextRunDay to simulate missed runs / late arrivals for grace window checks
+    await Mandate.updateOne({ _id: mActiveDueDec5._id }, { $set: { nextRunDay: "2026-12-05" } });
+    await MandateRun.deleteMany({});
+
     // Test Grace Window boundaries relative to mandate due on 2026-12-05:
     // Day 1 late (Dec 6): Dec 5 mandate (1 day late) + Dec 6 mandate (on time) -> due: 2
     const resDec6 = await get("/cron/autopay?date=2026-12-06", null, cronHeader);
     check("On 2026-12-06: due is 2 (1 day late + on time)", resDec6.data.due === 2);
 
+    await Mandate.updateOne({ _id: mActiveDueDec5._id }, { $set: { nextRunDay: "2026-12-05" } });
+    await Mandate.updateOne({ payerId, dayOfMonth: 6 }, { $set: { nextRunDay: "2026-12-06" } });
+    await MandateRun.deleteMany({});
+
     // Day 2 late (Dec 7): due: 2
     const resDec7 = await get("/cron/autopay?date=2026-12-07", null, cronHeader);
     check("On 2026-12-07: due is 2 (both inside grace window)", resDec7.data.due === 2);
 
+    await Mandate.updateOne({ _id: mActiveDueDec5._id }, { $set: { nextRunDay: "2026-12-05" } });
+    await Mandate.updateOne({ payerId, dayOfMonth: 6 }, { $set: { nextRunDay: "2026-12-06" } });
+    await MandateRun.deleteMany({});
+
     // Day 3 late (Dec 8): Dec 5 mandate is 3 days late (still in grace window) -> due: 2
     const resDec8 = await get("/cron/autopay?date=2026-12-08", null, cronHeader);
     check("On 2026-12-08: due is 2 (3 days late is still in grace window)", resDec8.data.due === 2);
+
+    await Mandate.updateOne({ _id: mActiveDueDec5._id }, { $set: { nextRunDay: "2026-12-05" } });
+    await Mandate.updateOne({ payerId, dayOfMonth: 6 }, { $set: { nextRunDay: "2026-12-06" } });
+    await MandateRun.deleteMany({});
 
     // Day 4 late (Dec 9):
     // Dec 5 mandate is 4 days late (> 3 days grace window) -> processed as MISSED, advances nextRunDay to 2027-01-05!
@@ -415,7 +431,8 @@ async function main() {
     const janRunDoc = await MandateRun.findOne({ mandateId: mActiveDueDec5._id, dueDay: "2027-01-05" });
     check("Jan 5 MISSED run record persisted", janRunDoc?.status === "MISSED");
     const mAfterD4 = await Mandate.findById(mActiveDueDec5._id);
-    check("Mandate nextRunDay is now 2027-02-05", mAfterD4.nextRunDay === "2027-02-05");
+    // In Level 3: Jan 5 is marked MISSED, Feb 5 is paid within grace window, advancing to 2027-03-05 (D4 spec)
+    check("Mandate nextRunDay advanced to 2027-03-05 after catching up", mAfterD4.nextRunDay === "2027-03-05");
 
     // =========================================================================
     // Part 6: Concurrency Safety on MISSED Mandate Processing
@@ -548,46 +565,26 @@ async function main() {
     check("Overdue mandate nextRunDay advanced to 2027-01-01", refreshedOverdue.nextRunDay === "2027-01-01");
 
     // Due mandate verification:
-    // In Phase 2, due mandates are candidate-evaluated without money transfers or payment claiming (Level 3 responsibility).
-    // Both invocations observe the due mandate as a candidate (due === 1) without moving money or creating runs.
-    check("Concurrent invocation A reports due: 1", concurrentA.data.due === 1);
-    check("Concurrent invocation B reports due: 1", concurrentB.data.due === 1);
+    // With Level 3 active, exactly 1 payment succeeds across simultaneous invocations
+    const totalSucceeded = (concurrentA.data.succeeded || 0) + (concurrentB.data.succeeded || 0);
+    check("Across concurrent invocations, exactly 1 payment succeeded", totalSucceeded === 1, `Got: ${totalSucceeded}`);
 
     const dueRunsInDb = await MandateRun.find({ mandateId: dueMandate._id });
-    check("Zero MandateRun records created for due mandate in Phase 2", dueRunsInDb.length === 0);
+    check("Exactly 1 MandateRun record created for due mandate", dueRunsInDb.length === 1);
+    check("Due mandate run status is SUCCESS", dueRunsInDb[0]?.status === "SUCCESS");
 
     const refreshedDue = await Mandate.findById(dueMandate._id);
-    check("Due mandate nextRunDay remains unchanged in Phase 2 (awaiting Level 3 claim)", refreshedDue.nextRunDay === "2026-12-09");
+    check("Due mandate nextRunDay advanced to next month", refreshedDue.nextRunDay === "2027-01-09");
 
     // =========================================================================
-    // Part 9: Phase 2 Processing Boundary Verification
+    // Part 9: Financial Integrity & Ledger Reconciliation
     // =========================================================================
-    console.log("\n--- Phase 2 Processing Boundary (Strict Financial Non-Execution) ---");
-    // Verify that NO money operations were executed
-    const payerWalletAfter = await Wallet.findOne({ userId: payerId });
-    const payeeWalletAfter = await Wallet.findOne({ userId: payeeId });
-
-    check(
-      "Payer wallet balance is untouched (no money moved)",
-      payerWalletAfter.balance === payerWalletBefore.balance,
-      `Before: ${payerWalletBefore.balance}, After: ${payerWalletAfter.balance}`
-    );
-    check(
-      "Payee wallet balance is untouched (no money moved)",
-      payeeWalletAfter.balance === payeeWalletBefore.balance,
-      `Before: ${payeeWalletBefore.balance}, After: ${payeeWalletAfter.balance}`
-    );
-
-    const txnCount = await Transaction.countDocuments({ note: /AutoPay/i });
-    check("Zero AutoPay transactions created in Phase 2", txnCount === 0, `Got: ${txnCount}`);
-
-    const successRunCount = await MandateRun.countDocuments({ status: "SUCCESS" });
-    check("Zero SUCCESS MandateRun records created in Phase 2", successRunCount === 0);
+    console.log("\n--- Part 9: Financial Integrity & Ledger Reconciliation ---");
 
     const reconcileRes = await get("/admin/reconcile", null, { "x-admin-key": ADMIN_KEY });
     check("Admin reconcile returns 200", reconcileRes.status === 200);
-    check("moneyIsConserved is true", reconcileRes.data.moneyIsConserved === true);
-    check("mismatches count is 0", reconcileRes.data.mismatches?.length === 0);
+    check("moneyIsConserved is true across all user and system wallets", reconcileRes.data.moneyIsConserved === true);
+    check("Ledger balance mismatches count is 0", reconcileRes.data.mismatches?.length === 0);
 
   } finally {
     await mongoose.disconnect();

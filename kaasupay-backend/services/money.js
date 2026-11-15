@@ -157,112 +157,141 @@ export async function deposit({ toUserId, amount, note }) {
  * @returns {{ transaction, debitEntry, creditEntry, senderBalance, receiverBalance }}
  * @throws {MoneyError} on insufficient balance or missing wallet
  */
-export async function transfer({ fromUserId, toUserId, amount, note }) {
+/**
+ * Internal core transfer executor.
+ * Assumes a valid MongoDB transaction session is provided by caller.
+ *
+ * @param {{ fromUserId: string|ObjectId, toUserId: string|ObjectId, amount: number, note: string, session: import("mongoose").ClientSession }} params
+ * @returns {Promise<{ transaction, debitEntry, creditEntry, senderBalance, receiverBalance, rewardCard }>}
+ */
+async function executeTransferOperation({ fromUserId, toUserId, amount, note, session }) {
+  // 0. Daily limit check: add amount only if it still fits within limit
+  await checkAndConsumeDailyLimit(fromUserId, amount, session);
+
+  // Atomic conditional debit: only succeeds when balance >= amount.
+  // This is ONE database operation — no separate read, no race window.
+  const senderWallet = await Wallet.findOneAndUpdate(
+    { userId: fromUserId, balance: { $gte: amount } },
+    { $inc: { balance: -amount } },
+    { session, returnDocument: "after" }
+  );
+
+  if (!senderWallet) {
+    // Distinguish "wallet missing" from "insufficient balance" where possible.
+    const exists = await Wallet.findOne(
+      { userId: fromUserId },
+      null,
+      { session }
+    );
+    if (!exists) {
+      throw new MoneyError(404, "Sender wallet not found");
+    }
+    throw new MoneyError(400, "Insufficient balance");
+  }
+
+  // Credit the receiver's wallet.
+  const receiverWallet = await Wallet.findOneAndUpdate(
+    { userId: toUserId },
+    { $inc: { balance: amount } },
+    { session, returnDocument: "after" }
+  );
+
+  if (!receiverWallet) {
+    throw new MoneyError(404, "Receiver wallet not found");
+  }
+
+  const senderBalance = senderWallet.balance;
+  const receiverBalance = receiverWallet.balance;
+
+  // Create the TRANSFER transaction record.
+  const [txn] = await Transaction.create(
+    [
+      {
+        type: "TRANSFER",
+        fromUserId,
+        toUserId,
+        amount,
+        note,
+        status: "COMPLETED",
+      },
+    ],
+    { session }
+  );
+
+  // Create DEBIT entry for the sender.
+  const [debitEntry] = await LedgerEntry.create(
+    [
+      {
+        userId: fromUserId,
+        transactionId: txn._id,
+        direction: "DEBIT",
+        type: "TRANSFER",
+        amount,
+        balanceAfter: senderBalance,
+      },
+    ],
+    { session }
+  );
+
+  // Create CREDIT entry for the receiver.
+  const [creditEntry] = await LedgerEntry.create(
+    [
+      {
+        userId: toUserId,
+        transactionId: txn._id,
+        direction: "CREDIT",
+        type: "TRANSFER",
+        amount,
+        balanceAfter: receiverBalance,
+      },
+    ],
+    { session }
+  );
+
+  // Day 9: Issue promotional reward scratch card if eligible
+  const rewardCard = await issueRewardCardIfEligible({
+    payerId: fromUserId,
+    recipientId: toUserId,
+    paymentAmount: amount,
+    transactionId: txn._id,
+    session,
+  });
+
+  return {
+    transaction: txn,
+    debitEntry,
+    creditEntry,
+    senderBalance,
+    receiverBalance,
+    rewardCard,
+  };
+}
+
+/**
+ * Debits the sender and credits the receiver inside one MongoDB transaction.
+ * Supports caller-provided session for atomic orchestration (e.g. AutoPay Phase 3),
+ * or manages its own standalone transaction session if omitted.
+ *
+ * @param {object} params
+ * @param {string|ObjectId} params.fromUserId - Sender's user ObjectId (from JWT)
+ * @param {string|ObjectId} params.toUserId   - Receiver's user ObjectId
+ * @param {number}          params.amount     - Integer paise (validated by caller)
+ * @param {string}          params.note       - Human note
+ * @param {import("mongoose").ClientSession} [params.session] - Optional external session
+ * @returns {Promise<{ transaction, debitEntry, creditEntry, senderBalance, receiverBalance, rewardCard }>}
+ * @throws {MoneyError} on insufficient balance, missing wallet, or limit reached
+ */
+export async function transfer({ fromUserId, toUserId, amount, note, session: externalSession }) {
+  if (externalSession) {
+    return executeTransferOperation({ fromUserId, toUserId, amount, note, session: externalSession });
+  }
+
   const session = await mongoose.startSession();
   let result;
 
   try {
     await session.withTransaction(async () => {
-      // 0. Daily limit check: add amount only if it still fits within limit
-      await checkAndConsumeDailyLimit(fromUserId, amount, session);
-
-      // Atomic conditional debit: only succeeds when balance >= amount.
-      // This is ONE database operation — no separate read, no race window.
-      const senderWallet = await Wallet.findOneAndUpdate(
-        { userId: fromUserId, balance: { $gte: amount } },
-        { $inc: { balance: -amount } },
-        { session, new: true }
-      );
-
-      if (!senderWallet) {
-        // Distinguish "wallet missing" from "insufficient balance" where possible.
-        const exists = await Wallet.findOne(
-          { userId: fromUserId },
-          null,
-          { session }
-        );
-        if (!exists) {
-          throw new MoneyError(404, "Sender wallet not found");
-        }
-        throw new MoneyError(400, "Insufficient balance");
-      }
-
-      // Credit the receiver's wallet.
-      const receiverWallet = await Wallet.findOneAndUpdate(
-        { userId: toUserId },
-        { $inc: { balance: amount } },
-        { session, new: true }
-      );
-
-      if (!receiverWallet) {
-        throw new MoneyError(404, "Receiver wallet not found");
-      }
-
-      const senderBalance = senderWallet.balance;
-      const receiverBalance = receiverWallet.balance;
-
-      // Create the TRANSFER transaction record.
-      const [txn] = await Transaction.create(
-        [
-          {
-            type: "TRANSFER",
-            fromUserId,
-            toUserId,
-            amount,
-            note,
-            status: "COMPLETED",
-          },
-        ],
-        { session }
-      );
-
-      // Create DEBIT entry for the sender.
-      const [debitEntry] = await LedgerEntry.create(
-        [
-          {
-            userId: fromUserId,
-            transactionId: txn._id,
-            direction: "DEBIT",
-            type: "TRANSFER",
-            amount,
-            balanceAfter: senderBalance,
-          },
-        ],
-        { session }
-      );
-
-      // Create CREDIT entry for the receiver.
-      const [creditEntry] = await LedgerEntry.create(
-        [
-          {
-            userId: toUserId,
-            transactionId: txn._id,
-            direction: "CREDIT",
-            type: "TRANSFER",
-            amount,
-            balanceAfter: receiverBalance,
-          },
-        ],
-        { session }
-      );
-
-      // Day 9: Issue promotional reward scratch card if eligible
-      const rewardCard = await issueRewardCardIfEligible({
-        payerId: fromUserId,
-        recipientId: toUserId,
-        paymentAmount: amount,
-        transactionId: txn._id,
-        session,
-      });
-
-      result = {
-        transaction: txn,
-        debitEntry,
-        creditEntry,
-        senderBalance,
-        receiverBalance,
-        rewardCard,
-      };
+      result = await executeTransferOperation({ fromUserId, toUserId, amount, note, session });
     });
   } finally {
     await session.endSession();

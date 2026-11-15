@@ -6,6 +6,7 @@ import {
   isWithinGraceWindow,
   isBeyondGraceWindow,
   processMissedMandateRuns,
+  processDueMandatePayment,
 } from "../services/autopayService.js";
 
 /**
@@ -80,31 +81,48 @@ export async function handleAutopayCron(req, res) {
     const more = rawBatch.length > 50;
     const candidates = rawBatch.slice(0, 50);
 
-    // 4. Mandate Processing & Eligibility:
+    // 4. Mandate Processing & Exactly-Once Financial Execution:
     // - If beyond 3-day grace window (> 3 days late): persist MISSED MandateRun, advance nextRunDay month-by-month.
-    //   If its caught-up nextRunDay lands inside the grace window for today, it becomes eligible for payment.
-    // - If on-time or 1-3 days late (within grace window): eligible for payment ('due').
-    // - Phase 2 Processing Boundary: Zero wallet transfers, debits, or credits. Level 3 performs payments.
+    //   If caught-up nextRunDay lands inside grace window for today, it becomes eligible for payment.
+    // - For every due mandate inside grace window:
+    //   Execute atomic payment claim, transfer money (debit/credit/ledger/daily limit/rewards),
+    //   record SUCCESS MandateRun, and advance nextRunDay in one transaction.
+    //   If business failure occurs: roll back payment, record FAILED run, increment failedCount (auto-pause on 3).
     let totalDue = 0;
+    let totalSucceeded = 0;
+    let totalFailed = 0;
     let totalMissed = 0;
 
     for (const m of candidates) {
+      let targetPaymentDueDay = null;
+
       if (isBeyondGraceWindow(m.nextRunDay, today)) {
-        const { missedCount, eligibleForPayment } = await processMissedMandateRuns(m, today);
+        const { missedCount, finalNextRunDay, eligibleForPayment } = await processMissedMandateRuns(m, today);
         totalMissed += missedCount;
         if (eligibleForPayment) {
           totalDue++;
+          targetPaymentDueDay = finalNextRunDay;
         }
       } else if (isWithinGraceWindow(m.nextRunDay, today)) {
         totalDue++;
+        targetPaymentDueDay = m.nextRunDay;
+      }
+
+      if (targetPaymentDueDay) {
+        const paymentResult = await processDueMandatePayment(m, targetPaymentDueDay);
+        if (paymentResult.outcome === "SUCCESS") {
+          totalSucceeded++;
+        } else if (paymentResult.outcome === "FAILED") {
+          totalFailed++;
+        }
       }
     }
 
     return res.status(200).json({
       date: today,
       due: totalDue,
-      succeeded: 0,
-      failed: 0,
+      succeeded: totalSucceeded,
+      failed: totalFailed,
       missed: totalMissed,
       more,
     });
