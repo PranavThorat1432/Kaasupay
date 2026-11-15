@@ -6,6 +6,7 @@ import webhookRoutes from "./webhookRoutes.js";
 import withdrawalRoutes from "./withdrawals.js";
 import requestRoutes from "./requestRoutes.js";
 import rewardRoutes from "./rewardRoutes.js";
+import autopayRoutes from "./autopayRoutes.js";
 
 const router = express.Router();
 
@@ -24,6 +25,10 @@ router.use("/requests", requestRoutes);
 // Day 9 Rewards & Scratch Cards endpoints live under /rewards
 // (mounted at /api/v1/rewards by index.js).
 router.use("/rewards", rewardRoutes);
+
+// Day 10 AutoPay endpoints live under /autopay
+// (mounted at /api/v1/autopay by index.js).
+router.use("/autopay", autopayRoutes);
 
 // Direct alias for withdrawals (mounted at /api/v1/withdrawals)
 router.use("/withdrawals", withdrawalRoutes);
