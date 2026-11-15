@@ -14,6 +14,7 @@ import {
   ArrowUpRight,
   Landmark,
   Sparkles,
+  CalendarClock,
 } from 'lucide-react';
 import { useAuth, useWallet, useAppDispatch, useAppSelector } from '../../store/hooks';
 import { fetchWalletBalance } from '../../store/slices/walletSlice';
@@ -27,6 +28,7 @@ const navItems = [
   { name: 'Send Money', path: '/transfer', icon: Send },
   { name: 'Add Money', path: '/add-money', icon: PlusCircle },
   { name: 'Withdraw', path: '/withdraw', icon: ArrowUpRight },
+  { name: 'AutoPay', path: '/autopay', icon: CalendarClock },
   { name: 'Rewards', path: '/rewards', icon: Sparkles },
   { name: 'Bank Accounts', path: '/bank-accounts', icon: Landmark },
   { name: 'Transactions', path: '/transactions', icon: History },
