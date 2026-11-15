@@ -542,7 +542,7 @@ export default function ScratchCardCanvas({
           width: `${width}px`,
           height: `${height}px`,
         }}
-        className={`absolute inset-0 z-20 rounded-2xl cursor-grab active:cursor-grabbing shadow-lg transition-opacity duration-350 ${
+        className={`absolute inset-0 z-20 rounded-2xl cursor-grab shadow-lg transition-opacity duration-350 ${
           isFadingOut || isRevealed ? 'opacity-0 pointer-events-none' : 'opacity-100'
         }`}
       />
