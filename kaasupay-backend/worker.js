@@ -1,5 +1,7 @@
 // worker.js — Outbox payout worker for processing bank payouts
 import "dotenv/config";
+import os from "node:os";
+import crypto from "node:crypto";
 import mongoose from "mongoose";
 import { connectDB } from "./db.js";
 import { BANK_URL } from "./config.js";
@@ -8,6 +10,12 @@ import OutboxEvent from "./models/outboxEventModel.js";
 import BankAccount from "./models/bankAccountModel.js";
 import { reverseWithdrawal } from "./services/money.js";
 import { decryptAccountNumber } from "./services/encryption.js";
+import {
+  acquireOrRenewLease,
+  releaseLease,
+  validateLeaseOwnership,
+  runAutopayBatch,
+} from "./services/autopayService.js";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -285,7 +293,8 @@ export async function processJob(
 }
 
 /**
- * PayoutWorker class providing start/stop lifecycle management.
+ * PayoutWorker class providing start/stop lifecycle management,
+ * bank payout processing (priority), and integrated AutoPay batch processing.
  */
 export class PayoutWorker {
   constructor(options = {}) {
@@ -296,34 +305,180 @@ export class PayoutWorker {
     this.pollCount = 0;
     this.startedAt = null;
     this.lastError = null;
+
+    // AutoPay Distributed Coordination & Lifecycle State
+    const instanceUuid = crypto.randomUUID().slice(0, 8);
+    this.ownerId = options.ownerId || `worker:${os.hostname()}:${process.pid}:${instanceUuid}`;
+    this.autopayEnabled = options.autopayEnabled !== undefined
+      ? options.autopayEnabled
+      : (process.env.AUTOPAY_WORKER_ENABLED !== "false");
+    this.autopayIntervalMs = options.autopayIntervalMs || 60000;
+    this.maxConsecutiveBatches = options.maxConsecutiveBatches || 2;
+    this.autopayBatchSize = options.autopayBatchSize || 50;
+    this.lastAutopayCheckAt = 0;
+    this.autopayHasMore = false;
+    this.currentFencingToken = null;
+    this.isProcessingBatch = false;
+    this.consecutiveErrors = 0;
+  }
+
+  async pollAutopay() {
+    if (!this.autopayEnabled || this.isStopping) return;
+
+    try {
+      // 1. Acquire or renew advisory lease
+      const leaseResult = await acquireOrRenewLease({
+        ownerId: this.ownerId,
+        leaseDurationMs: 60000,
+        metadata: {
+          hostname: os.hostname(),
+          pid: process.pid,
+        },
+      });
+
+      if (leaseResult.status === "ACQUIRED" || leaseResult.status === "RENEWED") {
+        this.currentFencingToken = leaseResult.lease.fencingToken;
+      } else {
+        // Held by another active worker or temporary acquisition failure
+        this.autopayHasMore = false;
+        this.currentFencingToken = null;
+        this.lastAutopayCheckAt = Date.now();
+        return;
+      }
+
+      // 2. Process up to maxConsecutiveBatches before yielding to Outbox
+      let consecutive = 0;
+      this.autopayHasMore = true;
+
+      while (!this.isStopping && this.autopayHasMore && consecutive < this.maxConsecutiveBatches) {
+        // Check if an Outbox job arrived while we were processing
+        // If so, break immediately to preserve bank payout priority
+        const pendingOutbox = await OutboxEvent.findOne({
+          $or: [
+            { status: "NEW", nextAttemptAt: { $lte: new Date() } },
+            {
+              status: "PROCESSING",
+              lockedAt: { $lte: new Date(Date.now() - (this.options.staleTimeoutMs || 60000)) },
+            },
+          ],
+        }).select("_id").lean();
+
+        if (pendingOutbox) {
+          // Cooperative yield: Outbox payout takes strict priority
+          break;
+        }
+
+        // Validate that this worker still holds the valid lease before launching batch
+        const isOwner = await validateLeaseOwnership({
+          ownerId: this.ownerId,
+          fencingToken: this.currentFencingToken,
+        });
+
+        if (!isOwner) {
+          // Lease was lost, expired, or overtaken by peer. Do NOT start another batch.
+          this.autopayHasMore = false;
+          this.currentFencingToken = null;
+          break;
+        }
+
+        this.isProcessingBatch = true;
+        try {
+          const batchResult = await runAutopayBatch({
+            today: this.options.today,
+            limit: this.autopayBatchSize,
+          });
+          this.autopayHasMore = batchResult.more;
+          consecutive++;
+        } finally {
+          this.isProcessingBatch = false;
+        }
+      }
+
+      this.lastAutopayCheckAt = Date.now();
+      this.consecutiveErrors = 0;
+    } catch (err) {
+      this.lastError = err.message;
+      this.autopayHasMore = false;
+      this.lastAutopayCheckAt = Date.now();
+      console.error("[worker] AutoPay poll error:", err.message);
+    }
   }
 
   async start() {
     this.running = true;
     this.startedAt = new Date();
     console.log("[worker] Payout worker started.");
+    console.log(`[worker] AutoPay processor initialized (ownerId: ${this.ownerId}, autopayEnabled: ${this.autopayEnabled}).`);
 
     while (this.running) {
+      let didWork = false;
+
       try {
         this.lastPollAt = new Date();
         this.pollCount++;
+
+        // 1. Strict Priority: Probe and process next Outbox payout job first
         const job = await claimNextJob(this.options);
-        if (!job) {
-          await sleep(1000);
+        if (job) {
+          didWork = true;
+          await processJob(job, this.options);
+          this.consecutiveErrors = 0;
+          // Loop immediately to process any further queued payouts
           continue;
         }
 
-        await processJob(job, this.options);
+        // 2. Secondary: AutoPay processing when Outbox is idle
+        const now = Date.now();
+        const isAutopayDue = this.autopayEnabled && (
+          this.autopayHasMore || (now - this.lastAutopayCheckAt >= this.autopayIntervalMs)
+        );
+
+        if (isAutopayDue) {
+          didWork = true;
+          await this.pollAutopay();
+        }
+
+        this.consecutiveErrors = 0;
       } catch (err) {
+        this.consecutiveErrors++;
         this.lastError = err.message;
-        console.error("[worker] Loop error:", err.message);
-        await sleep(1000);
+        console.error(`[worker] Loop error (failure count: ${this.consecutiveErrors}):`, err.message);
+
+        // Bounded exponential backoff on errors: 1s, 2s, 4s, ... max 30s
+        const backoffMs = Math.min(1000 * Math.pow(2, this.consecutiveErrors - 1), 30000);
+        await sleep(backoffMs);
+        continue;
+      }
+
+      // If no outbox job was found and no autopay run was executed, sleep normal idle interval
+      if (!didWork && this.running) {
+        await sleep(this.options.idlePollIntervalMs || 1000);
       }
     }
   }
 
-  stop() {
+  async stop({ drainTimeoutMs = 5000 } = {}) {
     this.running = false;
+    this.isStopping = true;
+
+    // Gracefully await completion of any in-flight AutoPay batch transaction
+    const deadline = Date.now() + drainTimeoutMs;
+    while (this.isProcessingBatch && Date.now() < deadline) {
+      await sleep(50);
+    }
+
+    // Safely release held advisory lease AFTER in-flight processing completes
+    if (this.ownerId && this.currentFencingToken) {
+      try {
+        await releaseLease({
+          ownerId: this.ownerId,
+          fencingToken: this.currentFencingToken,
+        });
+      } catch (err) {
+        console.error("[worker] Error releasing lease during shutdown:", err.message);
+      }
+    }
+
     console.log("[worker] Payout worker stopped.");
   }
 
@@ -342,6 +497,14 @@ export class PayoutWorker {
       lastPollAt: this.lastPollAt ? this.lastPollAt.toISOString() : null,
       pollCount: this.pollCount,
       lastError: this.lastError || null,
+      autopay: {
+        enabled: this.autopayEnabled,
+        ownerId: this.ownerId,
+        fencingToken: this.currentFencingToken,
+        lastAutopayCheckAt: this.lastAutopayCheckAt ? new Date(this.lastAutopayCheckAt).toISOString() : null,
+        hasMore: this.autopayHasMore,
+        isProcessingBatch: this.isProcessingBatch,
+      },
     };
   }
 }
@@ -355,14 +518,14 @@ if (
     await connectDB();
     const worker = new PayoutWorker();
 
-    process.on("SIGINT", () => {
+    process.on("SIGINT", async () => {
       console.log("\n[worker] Gracefully shutting down worker...");
-      worker.stop();
+      await worker.stop();
       process.exit(0);
     });
 
-    process.on("SIGTERM", () => {
-      worker.stop();
+    process.on("SIGTERM", async () => {
+      await worker.stop();
       process.exit(0);
     });
 

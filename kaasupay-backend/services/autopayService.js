@@ -1,6 +1,7 @@
 import mongoose from "mongoose";
 import Mandate from "../models/mandateModel.js";
 import MandateRun from "../models/mandateRunModel.js";
+import SystemLease from "../models/systemLeaseModel.js";
 import { transfer, MoneyError } from "./money.js";
 import { indiaDay } from "./dailyLimitService.js";
 
@@ -494,4 +495,277 @@ export async function processDueMandatePayment(mandate, dueDay) {
     reason: "Mandate was not processed",
   });
   return { outcome: "SKIPPED" };
+}
+
+// ============================================================================
+// Phase 6.8: Distributed Lease & Shared Batch Processor Infrastructure
+// ============================================================================
+
+export const DEFAULT_AUTOPAY_LEASE_ID = "autopay_processor";
+
+/**
+ * Ensures the singleton lease document exists in the collection.
+ * Uses unconditional _id matching so upsert will NEVER collide with duplicate key errors.
+ *
+ * @param {string} [leaseId=DEFAULT_AUTOPAY_LEASE_ID]
+ * @returns {Promise<void>}
+ */
+export async function ensureLeaseInitialized(leaseId = DEFAULT_AUTOPAY_LEASE_ID) {
+  try {
+    await SystemLease.updateOne(
+      { _id: leaseId },
+      {
+        $setOnInsert: {
+          ownerId: null,
+          fencingToken: 0,
+          expiresAt: new Date(0), // Initialized as expired
+          acquiredAt: new Date(0),
+          lastHeartbeat: new Date(0),
+        },
+      },
+      { upsert: true }
+    );
+  } catch (err) {
+    // If two workers initialize concurrently, one inserts, the other encounters E11000 and ignores it
+    if (err.code !== 11000) throw err;
+  }
+}
+
+/**
+ * Atomically acquires or renews the AutoPay advisory lease.
+ *
+ * Guaranteed Properties:
+ * 1. Safe renewal: Current owner extends expiry without changing fencingToken.
+ * 2. Safe takeover: Expired lease or unowned lease increments fencingToken atomically.
+ * 3. Race-safe: Never overwrites an active lease owned by another active worker.
+ * 4. Deterministic return status: ACQUIRED, RENEWED, HELD_BY_OTHER, or ERROR.
+ *
+ * @param {object} params
+ * @param {string} params.ownerId - Unique identifier (e.g. "worker:hostname:pid:uuid")
+ * @param {string} [params.leaseId=DEFAULT_AUTOPAY_LEASE_ID] - Lease ID
+ * @param {number} [params.leaseDurationMs=60000] - Lease validity duration in ms
+ * @param {object} [params.metadata={}] - Optional metadata (hostname, pid, etc.)
+ * @returns {Promise<{ status: "ACQUIRED"|"RENEWED"|"HELD_BY_OTHER"|"ERROR", lease?: object, error?: string }>}
+ */
+export async function acquireOrRenewLease({
+  ownerId,
+  leaseId = DEFAULT_AUTOPAY_LEASE_ID,
+  leaseDurationMs = 60000,
+  metadata = {},
+} = {}) {
+  if (!ownerId) {
+    throw new Error("acquireOrRenewLease requires a valid ownerId");
+  }
+
+  try {
+    await ensureLeaseInitialized(leaseId);
+    const now = new Date();
+    const newExpiresAt = new Date(now.getTime() + leaseDurationMs);
+
+    // Step 1: Attempt Safe Renewal (Owner already holds a non-expired lease)
+    // Fencing token is NOT incremented on renewals (preserves monotonicity per tenure)
+    const renewed = await SystemLease.findOneAndUpdate(
+      {
+        _id: leaseId,
+        ownerId: ownerId,
+        expiresAt: { $gte: now },
+      },
+      {
+        $set: {
+          expiresAt: newExpiresAt,
+          lastHeartbeat: now,
+          metadata,
+        },
+      },
+      { returnDocument: "after" }
+    );
+
+    if (renewed) {
+      return { status: "RENEWED", lease: renewed.toObject ? renewed.toObject() : renewed };
+    }
+
+    // Step 2: Attempt Safe Acquisition / Takeover (Lease is unowned or expired)
+    // Fencing token is monotonically incremented on ownership changes
+    const acquired = await SystemLease.findOneAndUpdate(
+      {
+        _id: leaseId,
+        $or: [
+          { expiresAt: { $lt: now } },
+          { ownerId: null },
+        ],
+      },
+      {
+        $set: {
+          ownerId: ownerId,
+          expiresAt: newExpiresAt,
+          acquiredAt: now,
+          lastHeartbeat: now,
+          metadata,
+        },
+        $inc: { fencingToken: 1 },
+      },
+      { returnDocument: "after" }
+    );
+
+    if (acquired) {
+      return { status: "ACQUIRED", lease: acquired.toObject ? acquired.toObject() : acquired };
+    }
+
+    // Step 3: Held by another active owner
+    const activeLease = await SystemLease.findById(leaseId).lean();
+    return {
+      status: "HELD_BY_OTHER",
+      lease: activeLease,
+    };
+  } catch (err) {
+    return {
+      status: "ERROR",
+      error: err.message,
+    };
+  }
+}
+
+/**
+ * Releases the lease if held by the caller with the matching ownerId and optional fencingToken.
+ *
+ * @param {object} params
+ * @param {string} params.ownerId - Owner identifier
+ * @param {string} [params.leaseId=DEFAULT_AUTOPAY_LEASE_ID] - Lease ID
+ * @param {number} [params.fencingToken] - Optional fencing token for strict release
+ * @returns {Promise<boolean>} True if released, false if unheld or owned by another
+ */
+export async function releaseLease({
+  ownerId,
+  leaseId = DEFAULT_AUTOPAY_LEASE_ID,
+  fencingToken = null,
+} = {}) {
+  if (!ownerId) return false;
+
+  const query = { _id: leaseId, ownerId };
+  if (typeof fencingToken === "number") {
+    query.fencingToken = fencingToken;
+  }
+
+  const released = await SystemLease.findOneAndUpdate(
+    query,
+    {
+      $set: {
+        ownerId: null,
+        expiresAt: new Date(0),
+        lastHeartbeat: new Date(),
+      },
+    },
+    { returnDocument: "after" }
+  );
+
+  return Boolean(released);
+}
+
+/**
+ * Validates that the specified ownerId (and optional fencingToken) currently holds a valid,
+ * non-expired lease. Used before initiating every new mandate batch.
+ *
+ * @param {object} params
+ * @param {string} params.ownerId
+ * @param {string} [params.leaseId=DEFAULT_AUTOPAY_LEASE_ID]
+ * @param {number} [params.fencingToken]
+ * @returns {Promise<boolean>}
+ */
+export async function validateLeaseOwnership({
+  ownerId,
+  leaseId = DEFAULT_AUTOPAY_LEASE_ID,
+  fencingToken = null,
+} = {}) {
+  if (!ownerId) return false;
+  const now = new Date();
+
+  const query = {
+    _id: leaseId,
+    ownerId,
+    expiresAt: { $gte: now },
+  };
+
+  if (typeof fencingToken === "number") {
+    query.fencingToken = fencingToken;
+  }
+
+  const doc = await SystemLease.findOne(query).lean();
+  return Boolean(doc);
+}
+
+/**
+ * Executes a single bounded batch of due AutoPay mandates.
+ * Shared by both the dedicated worker (worker.js) and the Vercel Cron HTTP fallback.
+ *
+ * Preserves exact Day 10 Phase 3-5 financial and grace-period invariants:
+ * - Queries active mandates due on or before target date, oldest first.
+ * - Handles multi-month overdue mandates via processMissedMandateRuns().
+ * - Processes due mandates within grace window via processDueMandatePayment().
+ * - Returns detailed batch execution statistics and whether additional candidates exist.
+ *
+ * @param {object} [options]
+ * @param {string} [options.today=indiaDay()] - Reference date (IST "YYYY-MM-DD")
+ * @param {number} [options.limit=50] - Maximum mandates to process in this single batch
+ * @returns {Promise<{ date: string, candidatesCount: number, due: number, succeeded: number, failed: number, missed: number, errors: number, skipped: number, processed: number, more: boolean }>}
+ */
+export async function runAutopayBatch({ today = indiaDay(), limit = 50 } = {}) {
+  // Query limit + 1 items to reliably detect if more eligible mandates exist
+  const rawBatch = await Mandate.find({
+    status: "ACTIVE",
+    nextRunDay: { $lte: today },
+  })
+    .sort({ nextRunDay: 1, createdAt: 1, _id: 1 })
+    .limit(limit + 1);
+
+  const more = rawBatch.length > limit;
+  const candidates = rawBatch.slice(0, limit);
+
+  let totalDue = 0;
+  let totalSucceeded = 0;
+  let totalFailed = 0;
+  let totalMissed = 0;
+  let totalErrors = 0;
+  let totalSkipped = 0;
+
+  for (const m of candidates) {
+    let targetPaymentDueDay = null;
+
+    if (isBeyondGraceWindow(m.nextRunDay, today)) {
+      const { missedCount, finalNextRunDay, eligibleForPayment } = await processMissedMandateRuns(m, today);
+      totalMissed += missedCount;
+      if (eligibleForPayment) {
+        totalDue++;
+        targetPaymentDueDay = finalNextRunDay;
+      }
+    } else if (isWithinGraceWindow(m.nextRunDay, today)) {
+      totalDue++;
+      targetPaymentDueDay = m.nextRunDay;
+    }
+
+    if (targetPaymentDueDay) {
+      const paymentResult = await processDueMandatePayment(m, targetPaymentDueDay);
+      if (paymentResult.outcome === "SUCCESS") {
+        totalSucceeded++;
+      } else if (paymentResult.outcome === "FAILED") {
+        totalFailed++;
+      } else if (paymentResult.outcome === "ERROR") {
+        totalErrors++;
+      } else if (paymentResult.outcome === "SKIPPED") {
+        totalSkipped++;
+      }
+    }
+  }
+
+  return {
+    date: today,
+    candidatesCount: candidates.length,
+    due: totalDue,
+    succeeded: totalSucceeded,
+    failed: totalFailed,
+    missed: totalMissed,
+    errors: totalErrors,
+    skipped: totalSkipped,
+    processed: candidates.length,
+    more,
+  };
 }

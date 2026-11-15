@@ -160,7 +160,7 @@ export async function stopServer() {
   isShuttingDown = true;
 
   if (workerInstance) {
-    workerInstance.stop();
+    await workerInstance.stop();
   }
 
   if (bankServerInstance) {

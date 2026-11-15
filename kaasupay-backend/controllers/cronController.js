@@ -1,12 +1,10 @@
 import crypto from "node:crypto";
-import Mandate from "../models/mandateModel.js";
 import { indiaDay } from "../services/dailyLimitService.js";
 import { isValidDateStr } from "../services/dateUtils.js";
 import {
-  isWithinGraceWindow,
-  isBeyondGraceWindow,
-  processMissedMandateRuns,
-  processDueMandatePayment,
+  runAutopayBatch,
+  acquireOrRenewLease,
+  releaseLease,
   logOperationalEvent,
 } from "../services/autopayService.js";
 
@@ -75,58 +73,80 @@ export async function handleAutopayCron(req, res) {
       date: today,
     });
 
-    // 3. Batch query due ACTIVE mandates from MongoDB (oldest due date first)
-    // Fetch up to 51 items to detect if more eligible mandates exist without unbounded memory load
-    const rawBatch = await Mandate.find({
-      status: "ACTIVE",
-      nextRunDay: { $lte: today },
-    })
-      .sort({ nextRunDay: 1, createdAt: 1, _id: 1 })
-      .limit(51);
+    // 3. Fallback Coordination via Advisory Lease
+    // In normal scheduled operation (no date override): Check if dedicated worker holds active lease.
+    // If so, cron skips quietly. If req.query.date is provided during time-travel testing,
+    // cron processes for that specific test date directly.
+    let cronOwnerId = null;
 
-    const more = rawBatch.length > 50;
-    const candidates = rawBatch.slice(0, 50);
+    if (!req.query.date) {
+      cronOwnerId = `cron:${crypto.randomUUID().slice(0, 8)}`;
+      const leaseResult = await acquireOrRenewLease({
+        ownerId: cronOwnerId,
+        leaseDurationMs: 30000, // Short fallback lease
+        metadata: { trigger: "vercel_cron", date: today },
+      });
 
-    // 4. Mandate Processing & Exactly-Once Financial Execution:
-    // - If beyond 3-day grace window (> 3 days late): persist MISSED MandateRun, advance nextRunDay month-by-month.
-    //   If caught-up nextRunDay lands inside grace window for today, it becomes eligible for payment.
-    // - For every due mandate inside grace window:
-    //   Execute atomic payment claim, transfer money (debit/credit/ledger/daily limit/rewards),
-    //   record SUCCESS MandateRun, and advance nextRunDay in one transaction.
-    //   If business failure occurs: roll back payment, record FAILED run, increment failedCount (auto-pause on 3).
+      if (leaseResult.status === "HELD_BY_OTHER") {
+        logOperationalEvent("cron_skipped_worker_active", {
+          date: today,
+          activeWorker: leaseResult.lease?.ownerId,
+        });
+        return res.status(200).json({
+          status: "SKIPPED",
+          reason: "Worker active",
+          leaseHolder: leaseResult.lease?.ownerId,
+          date: today,
+          due: 0,
+          succeeded: 0,
+          failed: 0,
+          missed: 0,
+          errors: 0,
+          skipped: 0,
+          more: false,
+        });
+      }
+    }
+
+    // 4. Bounded In-Process Execution Budget
+    // Default budget is 8000ms (assumes conservative 10s serverless limit with 2000ms margin)
+    const EXECUTION_BUDGET_MS = parseInt(process.env.CRON_EXECUTION_BUDGET_MS || "8000", 10);
     let totalDue = 0;
     let totalSucceeded = 0;
     let totalFailed = 0;
     let totalMissed = 0;
     let totalErrors = 0;
     let totalSkipped = 0;
+    let batchesExecuted = 0;
+    let lastBatchDurationMs = 0;
+    let hasMore = true;
 
-    for (const m of candidates) {
-      let targetPaymentDueDay = null;
+    try {
+      while (hasMore) {
+        const elapsed = Date.now() - cronStartTime;
+        const estimatedNextBatchMs = batchesExecuted === 0 ? 2500 : Math.max(lastBatchDurationMs * 1.2, 1000);
 
-      if (isBeyondGraceWindow(m.nextRunDay, today)) {
-        const { missedCount, finalNextRunDay, eligibleForPayment } = await processMissedMandateRuns(m, today);
-        totalMissed += missedCount;
-        if (eligibleForPayment) {
-          totalDue++;
-          targetPaymentDueDay = finalNextRunDay;
+        if (elapsed + estimatedNextBatchMs >= EXECUTION_BUDGET_MS) {
+          break;
         }
-      } else if (isWithinGraceWindow(m.nextRunDay, today)) {
-        totalDue++;
-        targetPaymentDueDay = m.nextRunDay;
+
+        const batchStart = Date.now();
+        const batchResult = await runAutopayBatch({ today, limit: 50 });
+        lastBatchDurationMs = Date.now() - batchStart;
+
+        batchesExecuted++;
+        totalDue += batchResult.due;
+        totalSucceeded += batchResult.succeeded;
+        totalFailed += batchResult.failed;
+        totalMissed += batchResult.missed;
+        totalErrors += batchResult.errors;
+        totalSkipped += batchResult.skipped;
+        hasMore = batchResult.more;
       }
-
-      if (targetPaymentDueDay) {
-        const paymentResult = await processDueMandatePayment(m, targetPaymentDueDay);
-        if (paymentResult.outcome === "SUCCESS") {
-          totalSucceeded++;
-        } else if (paymentResult.outcome === "FAILED") {
-          totalFailed++;
-        } else if (paymentResult.outcome === "ERROR") {
-          totalErrors++;
-        } else if (paymentResult.outcome === "SKIPPED") {
-          totalSkipped++;
-        }
+    } finally {
+      // Always safely release fallback lease if acquired
+      if (cronOwnerId) {
+        await releaseLease({ ownerId: cronOwnerId });
       }
     }
 
@@ -138,6 +158,8 @@ export async function handleAutopayCron(req, res) {
       missed: totalMissed,
       errors: totalErrors,
       skipped: totalSkipped,
+      batchesExecuted,
+      more: hasMore,
       durationMs: Date.now() - cronStartTime,
     });
 
@@ -149,7 +171,8 @@ export async function handleAutopayCron(req, res) {
       missed: totalMissed,
       errors: totalErrors,
       skipped: totalSkipped,
-      more,
+      batchesExecuted,
+      more: hasMore,
     });
   } catch (err) {
     console.error("[handleAutopayCron Error]", err);
