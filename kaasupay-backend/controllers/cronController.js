@@ -7,6 +7,7 @@ import {
   isBeyondGraceWindow,
   processMissedMandateRuns,
   processDueMandatePayment,
+  logOperationalEvent,
 } from "../services/autopayService.js";
 
 /**
@@ -69,6 +70,11 @@ export async function handleAutopayCron(req, res) {
       today = req.query.date;
     }
 
+    const cronStartTime = Date.now();
+    logOperationalEvent("cron_started", {
+      date: today,
+    });
+
     // 3. Batch query due ACTIVE mandates from MongoDB (oldest due date first)
     // Fetch up to 51 items to detect if more eligible mandates exist without unbounded memory load
     const rawBatch = await Mandate.find({
@@ -92,6 +98,8 @@ export async function handleAutopayCron(req, res) {
     let totalSucceeded = 0;
     let totalFailed = 0;
     let totalMissed = 0;
+    let totalErrors = 0;
+    let totalSkipped = 0;
 
     for (const m of candidates) {
       let targetPaymentDueDay = null;
@@ -114,9 +122,24 @@ export async function handleAutopayCron(req, res) {
           totalSucceeded++;
         } else if (paymentResult.outcome === "FAILED") {
           totalFailed++;
+        } else if (paymentResult.outcome === "ERROR") {
+          totalErrors++;
+        } else if (paymentResult.outcome === "SKIPPED") {
+          totalSkipped++;
         }
       }
     }
+
+    logOperationalEvent("cron_completed", {
+      date: today,
+      due: totalDue,
+      succeeded: totalSucceeded,
+      failed: totalFailed,
+      missed: totalMissed,
+      errors: totalErrors,
+      skipped: totalSkipped,
+      durationMs: Date.now() - cronStartTime,
+    });
 
     return res.status(200).json({
       date: today,
@@ -124,6 +147,8 @@ export async function handleAutopayCron(req, res) {
       succeeded: totalSucceeded,
       failed: totalFailed,
       missed: totalMissed,
+      errors: totalErrors,
+      skipped: totalSkipped,
       more,
     });
   } catch (err) {

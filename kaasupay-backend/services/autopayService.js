@@ -5,6 +5,22 @@ import { transfer, MoneyError } from "./money.js";
 import { indiaDay } from "./dailyLimitService.js";
 
 /**
+ * Emits sanitized structured JSON operational logs.
+ * Never logs PINs, passwords, secrets, tokens, or wallet balances.
+ *
+ * @param {string} event - Event name
+ * @param {object} [data={}] - Sanitized event metadata
+ */
+export function logOperationalEvent(event, data = {}) {
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    event,
+    ...data,
+  };
+  console.log(JSON.stringify(logEntry));
+}
+
+/**
  * Calculates the next run day for a given dayOfMonth (1-28) from a reference date in India Standard Time.
  * Non-negotiable rule: Never charge on the creation date.
  * If dayOfMonth <= currentDay, next occurrence is in the following month.
@@ -189,6 +205,12 @@ export async function processMissedMandateRuns(mandate, todayStr) {
           ],
           { session }
         );
+
+        logOperationalEvent("autopay_run_missed", {
+          mandateId: mandate._id.toString(),
+          dueDay,
+          daysLate,
+        });
       });
     } catch (err) {
       console.error(
@@ -255,6 +277,12 @@ export async function recordFailedMandatePayment(mandate, dueDay, reason) {
           { $set: { status: "PAUSED" } },
           { session: failSession }
         );
+        logOperationalEvent("autopay_auto_paused", {
+          mandateId: mandate._id.toString(),
+          payerId: mandate.payerId.toString(),
+          dueDay,
+          failedCount: claimed.failedCount,
+        });
       }
 
       // 3. Create one FAILED MandateRun record
@@ -304,9 +332,10 @@ export async function recordFailedMandatePayment(mandate, dueDay, reason) {
  *
  * @param {object} mandate - Mandate mongoose document or object
  * @param {string} dueDay - "YYYY-MM-DD"
- * @returns {Promise<{ outcome: "SUCCESS"|"FAILED"|"SKIPPED"|"ERROR", transaction?: object, run?: object, reason?: string, paused?: boolean }>}
+ * @returns {Promise<{ outcome: "SUCCESS"|"FAILED"|"SKIPPED"|"ERROR", transaction?: object, run?: object, reason?: string, paused?: boolean, error?: string, category?: string }>}
  */
 export async function processDueMandatePayment(mandate, dueDay) {
+  const startTime = Date.now();
   const session = await mongoose.startSession();
   let paymentResult = null;
   let businessError = null;
@@ -363,7 +392,37 @@ export async function processDueMandatePayment(mandate, dueDay) {
       };
     });
   } catch (err) {
-    // Distinguish business failures from transient infrastructure errors
+    // 1. Transaction Outcome Safety: Handle ambiguous commit outcomes
+    // (e.g. UnknownTransactionCommitResult or network disconnect during commit acknowledgment)
+    const isCommitAmbiguous =
+      (typeof err.hasErrorLabel === "function" && err.hasErrorLabel("UnknownTransactionCommitResult")) ||
+      err.message?.includes("UnknownTransactionCommitResult") ||
+      err.name === "MongoNetworkTimeoutError" ||
+      err.name === "MongoNetworkError";
+
+    if (isCommitAmbiguous) {
+      try {
+        const existingRun = await MandateRun.findOne({ mandateId: mandate._id, dueDay });
+        if (existingRun && existingRun.status === "SUCCESS") {
+          logOperationalEvent("autopay_payment_success", {
+            mandateId: mandate._id.toString(),
+            dueDay,
+            transactionId: existingRun.transactionId ? existingRun.transactionId.toString() : null,
+            recoveredFromCommitError: true,
+            durationMs: Date.now() - startTime,
+          });
+          return {
+            outcome: "SUCCESS",
+            run: existingRun,
+            recovered: true,
+          };
+        }
+      } catch {
+        // Ignore lookup error and fall through to classification
+      }
+    }
+
+    // 2. Distinguish business failures from transient infrastructure errors
     const isBusiness =
       err instanceof MoneyError ||
       err.name === "MoneyError" ||
@@ -377,20 +436,51 @@ export async function processDueMandatePayment(mandate, dueDay) {
     if (isBusiness) {
       businessError = err;
     } else {
-      console.error(`[processDueMandatePayment] Non-business transaction error for mandate ${mandate._id}:`, err);
-      return { outcome: "ERROR", error: err.message };
+      logOperationalEvent("autopay_payment_error", {
+        mandateId: mandate._id.toString(),
+        dueDay,
+        error: err.message || "Unknown infrastructure error",
+        category: "TRANSIENT_INFRASTRUCTURE",
+        durationMs: Date.now() - startTime,
+      });
+      return {
+        outcome: "ERROR",
+        error: err.message,
+        category: "TRANSIENT_INFRASTRUCTURE",
+      };
     }
   } finally {
     await session.endSession();
   }
 
   if (paymentResult) {
+    if (paymentResult.outcome === "SUCCESS") {
+      logOperationalEvent("autopay_payment_success", {
+        mandateId: mandate._id.toString(),
+        dueDay,
+        transactionId: paymentResult.transaction?._id?.toString() || null,
+        durationMs: Date.now() - startTime,
+      });
+    } else if (paymentResult.outcome === "SKIPPED") {
+      logOperationalEvent("autopay_payment_skipped", {
+        mandateId: mandate._id.toString(),
+        dueDay,
+        reason: "Concurrent claim or mandate no longer ACTIVE",
+      });
+    }
     return paymentResult;
   }
 
   if (businessError) {
     // Execute failure recording in separate transaction
     const failOutcome = await recordFailedMandatePayment(mandate, dueDay, businessError.message);
+    logOperationalEvent("autopay_payment_failure", {
+      mandateId: mandate._id.toString(),
+      dueDay,
+      reason: businessError.message,
+      failedCount: failOutcome?.failedCount ?? (mandate.failedCount + 1),
+      durationMs: Date.now() - startTime,
+    });
     return {
       outcome: "FAILED",
       reason: businessError.message,
@@ -398,5 +488,10 @@ export async function processDueMandatePayment(mandate, dueDay) {
     };
   }
 
+  logOperationalEvent("autopay_payment_skipped", {
+    mandateId: mandate._id.toString(),
+    dueDay,
+    reason: "Mandate was not processed",
+  });
   return { outcome: "SKIPPED" };
 }
