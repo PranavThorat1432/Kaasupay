@@ -528,7 +528,7 @@ export default function ScratchCardCanvas({
       aria-valuemax={100}
       aria-valuetext={`${scratchedPercent}% revealed`}
       onKeyDown={handleKeyDown}
-      className="relative select-none touch-none focus:outline-hidden focus:ring-4 focus:ring-amber-400 rounded-2xl"
+      className="absolute inset-0 z-20 select-none touch-none focus:outline-hidden focus:ring-4 focus:ring-amber-400 rounded-2xl"
       style={{ width: `${width}px`, height: `${height}px` }}
     >
       {/* Top Foil Canvas */}
